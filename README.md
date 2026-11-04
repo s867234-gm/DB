@@ -81,7 +81,8 @@ D:\DB\
 │   ├── phase2_pilot_report.md       # 阶段 2 小样本核验报告
 │   ├── phase3_full_build_report.md  # 阶段 3 全市场全量构建报告
 │   └── phase4_update_report.md      # 阶段 4 增量更新与实战验收报告
-├── update_db.bat           # Windows 批处理一键更新脚本
+├── update_db.bat           # Windows 批处理一键更新脚本 (盘后默认 15:10 以后执行)
+├── update_intraday.bat     # Windows 批处理盘中实时分钟线更新脚本
 ├── .gitignore              # 忽略 DuckDB 二进制与日志缓存
 └── README.md               # 本项目完整技术文档
 ```
@@ -227,7 +228,8 @@ python scripts/run_daily_update.py --workers 16 --batch-size 200
 ```
 
 ### 2. Windows 桌面双击一键更新
-直接双击根目录下的 `update_db.bat`，即可自动激活环境并完成最新行情增量同步。
+- **盘后完整收盘更新（推荐 15:10 后）**：双击根目录下的 `update_db.bat`，自动同步最新已收盘日线与全天 16 根分钟线。
+- **盘中实时更新分钟线（交易时段 09:30~15:00）**：双击根目录下的 `update_intraday.bat`，仅同步当天已产生的分钟线并计算盘中动态 KDJ，日线自动隔离防污染。
 
 ---
 
