@@ -320,6 +320,9 @@ class MultiCycleKDJEngine:
         """
         计算日线全历史 6 个周期 (1d, 2d, 4d, 8d, 16d, 32d) 快照与最新状态
         """
+        if df_daily.empty:
+            return pd.DataFrame(columns=DAILY_SNAPSHOT_COLUMNS), (init_states or {})
+
         df = df_daily.copy()
         if 'bar_seq' not in df.columns:
             df['bar_seq'] = np.arange(len(df), dtype=np.int32)
@@ -385,13 +388,16 @@ class MultiCycleKDJEngine:
     @staticmethod
     def compute_minute_snapshot(
         df_minute: pd.DataFrame,
-        cutoff_date: str = '2024-10-01',
+        cutoff_date: Optional[str] = '2024-10-01',
         init_states: Optional[Dict[str, PeriodState]] = None
     ) -> Tuple[pd.DataFrame, Dict[str, PeriodState]]:
         """
         计算分钟线 4 个周期 (15m, 30m, 60m, 120m) 快照与最新状态
         输入数据通常从 2024-09-06 起预热，最终截取 trading_date >= cutoff_date 输出
         """
+        if df_minute.empty:
+            return pd.DataFrame(columns=MINUTE_SNAPSHOT_COLUMNS), (init_states or {})
+
         df = df_minute.copy()
         adj_factor = df['adj_factor'].to_numpy(dtype=np.float64)
         high_adj = df['high'].to_numpy(dtype=np.float64) * adj_factor

@@ -1,7 +1,7 @@
 # A-Share Multi-Cycle Snapshot Database (A_DB)
 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
-[![DuckDB](https://img.shields.io/badge/DuckDB-1.1.3-yellow.svg)](https://duckdb.org/)
+[![DuckDB](https://img.shields.io/badge/DuckDB-1.5.5-yellow.svg)](https://duckdb.org/)
 [![Numba](https://img.shields.io/badge/Numba-JIT-orange.svg)](https://numba.pydata.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -67,12 +67,15 @@ D:\DB\
 │   ├── builder.py          # 阶段 3 全市场历史数据全量构建引擎
 │   └── updater.py          # 阶段 4 幂等增量更新调度器
 ├── scripts/
-│   ├── run_daily_update.py # 日常增量更新命令行运行入口
+│   ├── pilot_verify.py     # 阶段 2 核心样本指标与规则 A 核验脚本
 │   ├── run_phase3_full_build.py # 全量构建入口
+│   ├── run_daily_update.py # 日常增量更新命令行运行入口
+│   ├── verify_phase4.py    # 阶段 4 增量同步与全库体检核验脚本
 │   └── verify_full_db.py   # 全库数据质量核验与健康体检脚本
 ├── tests/
 │   ├── test_kdj_engine.py  # KDJ 计算精度、列对齐与状态步进测试
-│   └── test_updater.py     # 增量幂等性、除权推进与槽位对齐测试
+│   ├── test_updater.py     # 增量幂等性、除权推进与槽位对齐测试
+│   └── test_views.py       # 前复权便捷视图与共振选股逻辑测试
 ├── docs/
 │   ├── phase1_inspection_report.md  # 阶段 1 源库探查报告
 │   ├── phase2_pilot_report.md       # 阶段 2 小样本核验报告
@@ -105,7 +108,7 @@ D:\DB\
 | `updated_at` | TIMESTAMP | 元数据最后更新时间戳 | `2026-11-04 14:15:00` |
 
 ### 2. 物理表 `corporate_action`（除权除息与股本事件）
-- **主键**: `(symbol, event_date)`
+- **主键**: `(symbol, event_date, category)`
 
 | 字段名 | 类型 | 说明 |
 | :--- | :--- | :--- |
@@ -131,7 +134,7 @@ D:\DB\
   - `sk_32d, sd_32d, skxl_32d, sdxl_32d, mk_32d, md_32d, mkxl_32d, mdxl_32d`
 
 ### 4. 物理表 `minute_snapshot`（15分钟级多周期快照）
-- **主键**: `(symbol, trading_date, slot_seq)`
+- **主键**: `(symbol, bar_end)`
 - **覆盖周期**: `15m, 30m, 60m, 120m`（4 个周期平铺）
 - **前 12 列基础行情**:
   - `symbol, code, trading_date, bar_end, slot_seq, open, high, low, close, volume, amount, adj_factor`
@@ -150,7 +153,7 @@ D:\DB\
 | :--- | :--- | :--- |
 | `symbol` | VARCHAR | 标的代码 |
 | `period` | VARCHAR | 周期标识 (`1d`, `2d`, `4d`, `8d`, `16d`, `32d`, `15m`, `30m`, `60m`, `120m`) |
-| `last_closed_bucket_id` | BIGINT | 最近已闭合桶序号 |
+| `last_closed_bucket_id` | INTEGER | 最近已闭合桶序号 |
 | `closed_highs_adj` | VARCHAR | 最近 104 个已闭合桶前复权最高价 (JSON Array) |
 | `closed_lows_adj` | VARCHAR | 最近 104 个已闭合桶前复权最低价 (JSON Array) |
 | `sk_closed` | DOUBLE | 最近闭合桶的 SK 终值 |

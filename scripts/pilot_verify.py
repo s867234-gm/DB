@@ -24,6 +24,22 @@ def run_pilot():
     print(">>> 启动阶段 2 小样本试跑与核验程序")
     print("=" * 60)
 
+    # 保护生产库：若 daily_snapshot 超过 100 万行且未加 --force-reset-pilot，拒绝清空与覆盖
+    force_reset = "--force-reset-pilot" in sys.argv
+    if os.path.exists(DEFAULT_DB_PATH):
+        chk_conn = duckdb.connect(DEFAULT_DB_PATH, read_only=True)
+        try:
+            d_cnt = chk_conn.execute("SELECT COUNT(*) FROM daily_snapshot").fetchone()[0]
+            if d_cnt > 1000000 and not force_reset:
+                print(f"\n[安全拦截] 目标库 {DEFAULT_DB_PATH} 包含全量生产数据 ({d_cnt:,} 行日线)。")
+                print("直接运行 pilot_verify 会清空样本标的的增量数据！")
+                print("若确需在生产库中强制重置核验，请使用: python scripts/pilot_verify.py --force-reset-pilot\n")
+                return
+        except Exception:
+            pass
+        finally:
+            chk_conn.close()
+
     # 1. 确保目标库与字典表初始化
     init_database()
     target_conn = duckdb.connect(DEFAULT_DB_PATH)

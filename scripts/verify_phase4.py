@@ -106,7 +106,7 @@ def run_verification():
         f.write(f"> **生成时间**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  \n")
         f.write(f"> **目标数据库**: `{DB_PATH}`  \n")
         f.write(f"> **增量同步区间**: `2026-10-31` ~ `{max_d_date}` (已完整收盘交易日: 2026-11-02, 2026-11-03, 2026-11-04)  \n")
-        f.write(f"> **测试套件状态**: `pytest tests/ -v` 12 项全部 PASS (100%)  \n\n")
+        f.write(f"> **测试套件状态**: `pytest tests/ -v` 14 项全部 PASS (100%)  \n\n")
         f.write("---\n\n")
 
         f.write("## 一、全库核心指标与更新成果\n\n")
@@ -129,7 +129,7 @@ def run_verification():
         f.write("- 历史行 `adj_factor` 永久固化不变；增量遇除权除息事件时，按标准等比复权公式计算新因子并单向放大，同步刷新 `security_info.latest_adj_factor`，前复权视图 `v_daily_qfq` 毫秒级动态除算，免去全库历史重写开销。\n\n")
 
         f.write("---\n\n")
-        f.write("## 三、抽样标的实战数据核验 (2026-10-30 ~ 2026-11-03)\n\n")
+        f.write("## 三、抽样标的实战数据核验 (2026-10-28 ~ 2026-11-04)\n\n")
         for sym in sample_symbols:
             f.write(f"### 标的 `{sym}` 日线快照样本\n\n")
             f.write("```text\n")
@@ -160,7 +160,7 @@ def run_verification():
         f.write("| `update_db.bat` | Windows 桌面批处理一键更新脚本 | 已交付 |\n")
         f.write("| `tests/test_updater.py` | 增量单元测试（因子推进、槽位解析、幂等性校验） | 100% PASS |\n")
         f.write("| `README.md` | 完整技术文档、数据字典、规则 A 数学原理与选股 SQL 示例 | 已交付 |\n")
-        f.write(r"| `D:\DB\A_DB.duckdb` | 实战补齐至 2026-11-03 最新收盘日全市场数据库 | 验收就绪 |" + "\n")
+        f.write(r"| `D:\DB\A_DB.duckdb` | 实战补齐至 2026-11-04 最新收盘日全市场数据库 | 验收就绪 |" + "\n")
 
     print(f"\n验收报告已成功生成: {REPORT_PATH}")
 

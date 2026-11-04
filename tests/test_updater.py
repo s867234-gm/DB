@@ -248,3 +248,165 @@ def test_updater_intraday_progression(tmp_path):
     assert last_slot_2 == 8
     assert slots == [1, 2, 3, 4, 5, 6, 7, 8]
 
+
+def test_intraday_does_not_pollute_daily_snapshot(tmp_path):
+    """测试盘中更新（--allow-intraday）绝不写入未收盘日线，且收盘后完整写入"""
+    db_file = str(tmp_path / "test_intraday_pollution.duckdb")
+    con = duckdb.connect(db_file)
+    create_tables(con)
+    con.execute("""
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, board, latest_adj_factor)
+        VALUES ('SZ000001', '000001', '平安银行', 'STOCK', 'SZSE', 'MAIN', 1.0)
+    """)
+    # 历史日线写入至 2026-10-15
+    dates = [datetime.date(2026, 10, 14), datetime.date(2026, 10, 15)]
+    init_d = [{
+        "symbol": "SZ000001", "code": "000001", "trade_date": d, "bar_seq": i,
+        "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.2, "volume": 1000.0, "amount": 10200.0, "adj_factor": 1.0,
+    } for i, d in enumerate(dates)]
+    df_init_d = pd.DataFrame(init_d)
+    df_init_snap, d_states = MultiCycleKDJEngine.compute_daily_snapshot(df_init_d)
+    con.register("tmp_d", df_init_snap)
+    con.execute("INSERT INTO daily_snapshot BY NAME SELECT * FROM tmp_d")
+    con.register("tmp_s", states_to_df(list(d_states.values())))
+    con.execute("INSERT INTO incremental_state BY NAME SELECT * FROM tmp_s")
+    con.close()
+
+    # 1. 模拟 2026-10-16 盘中 (上午 10:30，未收盘)
+    mock_fetcher = MagicMock()
+    mock_fetcher.get_latest_market_dates.return_value = (
+        datetime.date(2026, 10, 15), datetime.date(2026, 10, 16), False
+    )
+    mock_fetcher.get_latest_market_status.return_value = (
+        datetime.date(2026, 10, 16), False
+    )
+    mock_fetcher.fetch_xdxr_events.return_value = []
+    # 模拟通达信在盘中也返回了包含 2026-10-16 的未收盘日线
+    mock_fetcher.fetch_daily_bars.return_value = [
+        {"datetime": "2026-10-15", "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.2, "vol": 1000, "amount": 10200},
+        {"datetime": "2026-10-16", "open": 10.2, "high": 10.6, "low": 10.1, "close": 10.5, "vol": 500, "amount": 5250},
+    ]
+    # 分钟线返回 10-16 的 slot 1~4
+    mock_fetcher.fetch_minute_bars.return_value = [
+        {"datetime": "2026-10-16 09:45", "open": 10.2, "high": 10.3, "low": 10.1, "close": 10.3, "vol": 10000, "amount": 103000},
+        {"datetime": "2026-10-16 10:00", "open": 10.3, "high": 10.4, "low": 10.2, "close": 10.4, "vol": 10000, "amount": 104000},
+        {"datetime": "2026-10-16 10:15", "open": 10.4, "high": 10.5, "low": 10.3, "close": 10.4, "vol": 10000, "amount": 104000},
+        {"datetime": "2026-10-16 10:30", "open": 10.4, "high": 10.6, "low": 10.3, "close": 10.5, "vol": 10000, "amount": 105000},
+    ]
+
+    updater = DailyUpdater(db_path=db_file, fetcher=mock_fetcher)
+    res_intraday = updater.run_update(allow_intraday=True)
+    assert res_intraday["status"] == "SUCCESS"
+    assert res_intraday["minute_rows_added"] == 4
+    assert res_intraday["daily_rows_added"] == 0
+
+    con = duckdb.connect(db_file, read_only=True)
+    # 断言: daily_snapshot 绝不包含 2026-10-16
+    d_dates = [r[0] for r in con.execute("SELECT trade_date FROM daily_snapshot WHERE symbol = 'SZ000001'").fetchall()]
+    assert datetime.date(2026, 10, 16) not in d_dates
+    # 断言: minute_snapshot 包含了 2026-10-16 的 4 条
+    m_count = con.execute("SELECT COUNT(*) FROM minute_snapshot WHERE symbol = 'SZ000001' AND trading_date = '2026-10-16'").fetchone()[0]
+    assert m_count == 4
+    con.close()
+
+    # 2. 模拟 15:00 收盘后再次运行 (is_closed=True)
+    mock_fetcher.get_latest_market_dates.return_value = (
+        datetime.date(2026, 10, 16), datetime.date(2026, 10, 16), True
+    )
+    mock_fetcher.get_latest_market_status.return_value = (
+        datetime.date(2026, 10, 16), True
+    )
+    # 模拟完整的日线与全天 16 根分钟线
+    mock_fetcher.fetch_daily_bars.return_value = [
+        {"datetime": "2026-10-15", "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.2, "vol": 1000, "amount": 10200},
+        {"datetime": "2026-10-16", "open": 10.2, "high": 10.8, "low": 10.1, "close": 10.7, "vol": 1200, "amount": 12840},
+    ]
+    all_16_min = mock_fetcher.fetch_minute_bars.return_value + [
+        {"datetime": f"2026-10-16 {t}", "open": 10.5, "high": 10.7, "low": 10.4, "close": 10.6, "vol": 10000, "amount": 106000}
+        for _, t in [
+            (5, "10:45"), (6, "11:00"), (7, "11:15"), (8, "11:30"),
+            (9, "13:15"), (10, "13:30"), (11, "13:45"), (12, "14:00"),
+            (13, "14:15"), (14, "14:30"), (15, "14:45"), (16, "15:00")
+        ]
+    ]
+    mock_fetcher.fetch_minute_bars.return_value = all_16_min
+
+    res_closed = updater.run_update(allow_intraday=False)
+    assert res_closed["status"] == "SUCCESS"
+    assert res_closed["daily_rows_added"] == 1
+    assert res_closed["minute_rows_added"] == 12
+
+    con = duckdb.connect(db_file, read_only=True)
+    d_rows = con.execute("SELECT trade_date, close, bar_seq FROM daily_snapshot WHERE symbol = 'SZ000001' ORDER BY trade_date").fetchall()
+    assert len(d_rows) == 3
+    assert d_rows[-1][0] == datetime.date(2026, 10, 16)
+    assert d_rows[-1][1] == 10.7
+    assert d_rows[-1][2] == 2
+
+    m_total_16 = con.execute("SELECT COUNT(*) FROM minute_snapshot WHERE symbol = 'SZ000001' AND trading_date = '2026-10-16'").fetchone()[0]
+    assert m_total_16 == 16
+    con.close()
+
+
+def test_multi_day_ex_dividend_minute_adj_factor_mapping(tmp_path):
+    """测试跨多日补更遇除权除息时，分钟线 adj_factor 精确按日映射且互不串扰"""
+    db_file = str(tmp_path / "test_ex_dividend_mapping.duckdb")
+    con = duckdb.connect(db_file)
+    create_tables(con)
+    con.execute("""
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, board, latest_adj_factor)
+        VALUES ('SZ000001', '000001', '平安银行', 'STOCK', 'SZSE', 'MAIN', 1.0)
+    """)
+    # 历史日线截至 2026-10-14，最新因子 1.0，收盘价 10.0
+    con.execute("""
+        INSERT INTO daily_snapshot (
+            symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor
+        ) VALUES ('SZ000001', '000001', '2026-10-14', 10, 10.0, 10.5, 9.8, 10.0, 1000, 10000, 1.0)
+    """)
+    con.close()
+
+    # 一次补更两个交易日: 2026-10-15 和 2026-10-16
+    # 其中 2026-10-16 发生每 10 股派 5 元分红 (fenhong=5.0)
+    target_date = datetime.date(2026, 10, 16)
+    mock_fetcher = MagicMock()
+    mock_fetcher.get_latest_market_dates.return_value = (target_date, target_date, True)
+    mock_fetcher.get_latest_market_status.return_value = (target_date, True)
+
+    # 10-15 无除权，10-16 除权分红
+    mock_fetcher.fetch_xdxr_events.return_value = [
+        {"year": 2026, "month": 10, "day": 16, "category": 1, "fenhong": 5.0, "songzhuangu": 0.0, "peigu": 0.0, "peigujia": 0.0}
+    ]
+    mock_fetcher.fetch_daily_bars.return_value = [
+        {"datetime": "2026-10-14", "open": 10.0, "high": 10.5, "low": 9.8, "close": 10.0, "vol": 1000, "amount": 10000},
+        {"datetime": "2026-10-15", "open": 10.0, "high": 10.2, "low": 9.9, "close": 10.0, "vol": 1000, "amount": 10000},
+        {"datetime": "2026-10-16", "open": 9.5, "high": 9.8, "low": 9.4, "close": 9.6, "vol": 1000, "amount": 9600},
+    ]
+    mock_fetcher.fetch_minute_bars.return_value = [
+        {"datetime": "2026-10-15 09:45", "open": 10.0, "high": 10.1, "low": 9.9, "close": 10.0, "vol": 1000, "amount": 10000},
+        {"datetime": "2026-10-15 15:00", "open": 10.0, "high": 10.1, "low": 9.9, "close": 10.0, "vol": 1000, "amount": 10000},
+        {"datetime": "2026-10-16 09:45", "open": 9.5, "high": 9.6, "low": 9.4, "close": 9.5, "vol": 1000, "amount": 9500},
+        {"datetime": "2026-10-16 15:00", "open": 9.5, "high": 9.7, "low": 9.5, "close": 9.6, "vol": 1000, "amount": 9600},
+    ]
+
+    updater = DailyUpdater(db_path=db_file, fetcher=mock_fetcher)
+    res = updater.run_update(allow_intraday=False)
+    assert res["status"] == "SUCCESS"
+
+    con = duckdb.connect(db_file, read_only=True)
+    # 查看 minute_snapshot 的 adj_factor
+    df_m = con.execute("SELECT trading_date, slot_seq, adj_factor FROM minute_snapshot WHERE symbol = 'SZ000001' ORDER BY trading_date, slot_seq").df()
+    con.close()
+
+    # 10-15 的分钟线必须保持除权前的 1.0
+    m_15 = df_m[df_m["trading_date"] == datetime.date(2026, 10, 15)]
+    assert (m_15["adj_factor"] == 1.0).all()
+
+    # 10-16 的分钟线必须是除权后的新因子
+    # 10-15 收盘价为 10.0，每10股派5元 (每股0.5元)，除权基准价 10.0 - 0.5 = 9.5
+    # 新因子 = 1.0 * (10.0 / 9.5) = 1.0526315789...
+    m_16 = df_m[df_m["trading_date"] == datetime.date(2026, 10, 16)]
+    expected_new_adj = 1.0 * (10.0 / 9.5)
+    for fac in m_16["adj_factor"]:
+        assert abs(fac - expected_new_adj) < 1e-6
+        assert fac > 1.0
+

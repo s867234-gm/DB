@@ -96,6 +96,8 @@ class TdxConnectionPool:
 
     _instance = None
     _lock = threading.Lock()
+    _rr_counter = 0
+    _rr_lock = threading.Lock()
 
     def __init__(self, servers=None):
         self.servers = list(servers or BACKUP_SERVERS)
@@ -118,9 +120,14 @@ class TdxConnectionPool:
             except Exception:
                 pass
 
-        # 重新建立连接
+        # 重新建立连接，通过轮询偏移均匀分散不同工作线程到多台券商主站
+        with self._rr_lock:
+            start_idx = self._rr_counter % len(self.servers)
+            TdxConnectionPool._rr_counter += 1
+
+        ordered_servers = self.servers[start_idx:] + self.servers[:start_idx]
         api = TdxHq_API(heartbeat=False)
-        for ip, port, name in self.servers:
+        for ip, port, name in ordered_servers:
             try:
                 if api.connect(ip, port, time_out=2.0):
                     # 快速验证是否能取到测试 bar
@@ -153,12 +160,18 @@ class TdxFetcher:
     def __init__(self, pool: Optional[TdxConnectionPool] = None):
         self.pool = pool or TdxConnectionPool.get_instance()
 
-    def get_latest_market_status(self, allow_intraday: bool = False) -> Tuple[datetime.date, bool]:
-        """识别最新交易日及收盘状态。
+    def get_latest_market_dates(
+        self, allow_intraday: bool = False
+    ) -> Tuple[datetime.date, datetime.date, bool]:
+        """识别最新交易日、日线目标日、分钟线目标日及收盘状态。
         通过拉取上证指数 SH000001 的日线与 15 分钟线判定：
-        - 若 15 分钟线最后一条达到 15:00:00，则该日完整收盘；
-        - 若未达到 15:00:00 且 allow_intraday=False，则回退为上一个完整交易日；
-        - 返回 (target_trade_date, is_closed)
+        - 若 15 分钟线最后一条达到 15:00:00，则该日完整收盘（is_closed=True）；
+        - 若未达到 15:00:00，则处于盘中未收盘状态（is_closed=False）。
+
+        返回: (daily_target_date, minute_target_date, is_closed)
+        - daily_target_date: 最新已完整走完 15:00 收盘的交易日（若 is_closed 则为 latest_day；若盘中未收盘，无论 allow_intraday 为何值，必须取前一个已完整收盘交易日 prev_day）。
+        - minute_target_date: 若 is_closed 或 allow_intraday 则为 latest_day，否则为 prev_day。
+        - is_closed: 当天是否已完整走完 15:00。
         """
         api = self.pool.get_client()
         # 上证指数日线与 15 分钟线
@@ -181,15 +194,30 @@ class TdxFetcher:
             ):
                 is_closed = True
 
-        if not is_closed and not allow_intraday:
-            # 当天尚未走完 15:00 且不允许盘中更新，则最新收盘日为前一个交易日
-            if len(idx_daily) >= 2:
-                prev_day_str = idx_daily[-2]["datetime"][:10]
-                prev_day = datetime.datetime.strptime(prev_day_str, "%Y-%m-%d").date()
-                return prev_day, True
-            return latest_day, False
+        prev_day = None
+        if len(idx_daily) >= 2:
+            prev_day_str = idx_daily[-2]["datetime"][:10]
+            prev_day = datetime.datetime.strptime(prev_day_str, "%Y-%m-%d").date()
+        else:
+            prev_day = latest_day
 
-        return latest_day, is_closed
+        if is_closed:
+            daily_target_date = latest_day
+            minute_target_date = latest_day
+        else:
+            daily_target_date = prev_day
+            minute_target_date = latest_day if allow_intraday else prev_day
+
+        return daily_target_date, minute_target_date, is_closed
+
+    def get_latest_market_status(
+        self, allow_intraday: bool = False
+    ) -> Tuple[datetime.date, bool]:
+        """识别最新交易日及收盘状态（保留兼容旧接口）。
+        返回: (minute_target_date, is_closed)
+        """
+        _, minute_target_date, is_closed = self.get_latest_market_dates(allow_intraday)
+        return minute_target_date, is_closed
 
     def fetch_daily_bars(
         self, symbol: str, sec_type: str, offset: int = 15
@@ -205,12 +233,18 @@ class TdxFetcher:
                     bars = api.get_index_bars(4, market, code, 0, offset)
                 else:
                     bars = api.get_security_bars(4, market, code, 0, offset)
+                if bars is not None and len(bars) > 0:
+                    return bars
+                if not bars and retry == 0:
+                    self.pool.disconnect_thread()
+                    continue
                 return bars or []
             except Exception:
                 self.pool.disconnect_thread()
                 if retry == 1:
                     logger.warning(f"{symbol} 拉取日线失败")
                     return []
+        return []
 
     def fetch_minute_bars(
         self, symbol: str, sec_type: str, offset: int = 48
@@ -226,25 +260,38 @@ class TdxFetcher:
                     bars = api.get_index_bars(1, market, code, 0, offset)
                 else:
                     bars = api.get_security_bars(1, market, code, 0, offset)
+                if bars is not None and len(bars) > 0:
+                    return bars
+                if not bars and retry == 0:
+                    self.pool.disconnect_thread()
+                    continue
                 return bars or []
             except Exception:
                 self.pool.disconnect_thread()
                 if retry == 1:
                     logger.warning(f"{symbol} 拉取分钟线失败")
                     return []
+        return []
 
     def fetch_xdxr_events(self, symbol: str) -> List[Dict]:
-        """获取除权除息及股本变动事件"""
+        """获取除权除息及股本变动事件（带 2 次重试与断开保护）"""
         market, code, is_idx = parse_symbol(symbol)
         if is_idx:
             return []
-        api = self.pool.get_client()
-        try:
-            items = api.get_xdxr_info(market, code)
-            return items or []
-        except Exception as e:
-            logger.warning(f"{symbol} 拉取除权除息失败: {e}")
-            return []
+        for retry in range(2):
+            try:
+                api = self.pool.get_client()
+                items = api.get_xdxr_info(market, code)
+                if items is None and retry == 0:
+                    self.pool.disconnect_thread()
+                    continue
+                return items or []
+            except Exception as e:
+                self.pool.disconnect_thread()
+                if retry == 1:
+                    logger.warning(f"{symbol} 拉取除权除息失败: {e}")
+                    return []
+        return []
 
 
 def is_stock_symbol(symbol: str) -> bool:
