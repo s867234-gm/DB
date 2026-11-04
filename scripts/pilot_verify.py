@@ -144,29 +144,38 @@ def run_pilot():
         total_minute_rows += len(df_min_snap)
 
         # ----------------------------------------------------
-        # 6. 数据入库 A_DB.duckdb
+        # 6. 数据入库 A_DB.duckdb (严格使用 BY NAME 杜绝任何列错位)
         # ----------------------------------------------------
         t0 = time.perf_counter()
         # 写入 daily_snapshot
         target_conn.register("df_daily_snap", df_daily_snap)
-        target_conn.execute("INSERT INTO daily_snapshot SELECT * FROM df_daily_snap")
+        target_conn.execute("INSERT OR REPLACE INTO daily_snapshot BY NAME SELECT * FROM df_daily_snap")
         target_conn.unregister("df_daily_snap")
 
         # 写入 minute_snapshot
         target_conn.register("df_min_snap", df_min_snap)
-        target_conn.execute("INSERT INTO minute_snapshot SELECT * FROM df_min_snap")
+        target_conn.execute("INSERT OR REPLACE INTO minute_snapshot BY NAME SELECT * FROM df_min_snap")
         target_conn.unregister("df_min_snap")
+
+        # 更新 security_info.latest_adj_factor
+        latest_factor = float(df_daily_snap['adj_factor'].iloc[-1])
+        target_conn.execute(f"UPDATE security_info SET latest_adj_factor = {latest_factor} WHERE symbol = '{sym_new}'")
 
         # 写入 incremental_state (10 个周期: 6 日线 + 4 分钟线)
         now_ts = datetime.now()
+        inc_rows = []
         for p_name, st in d_states.items():
-            target_conn.execute("""
-                INSERT OR REPLACE INTO incremental_state VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, st.to_db_row(updated_at=now_ts))
+            inc_rows.append(st.to_db_row(updated_at=now_ts))
         for p_name, st in m_states.items():
-            target_conn.execute("""
-                INSERT OR REPLACE INTO incremental_state VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, st.to_db_row(updated_at=now_ts))
+            inc_rows.append(st.to_db_row(updated_at=now_ts))
+        df_inc_rows = pd.DataFrame(inc_rows, columns=[
+            'symbol', 'period', 'last_closed_bucket_id', 'closed_highs_adj', 'closed_lows_adj',
+            'sk_closed', 'sd_closed', 'mk_closed', 'md_closed', 'last_valid_rsv13', 'last_valid_rsv104',
+            'bar_count', 'high_adj', 'low_adj', 'updated_at'
+        ])
+        target_conn.register("df_inc_rows", df_inc_rows)
+        target_conn.execute("INSERT OR REPLACE INTO incremental_state BY NAME SELECT * FROM df_inc_rows")
+        target_conn.unregister("df_inc_rows")
         t_insert = time.perf_counter() - t0
         sym_perf['db_insert_s'] = t_insert
 

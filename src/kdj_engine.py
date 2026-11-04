@@ -5,7 +5,7 @@ import numba as nb
 from typing import Dict, Tuple, List, Optional
 from dataclasses import dataclass, asdict
 
-# 周期配置常量
+# 基础与指标列定义常量
 DAILY_PERIODS = [1, 2, 4, 8, 16, 32]
 DAILY_PERIOD_NAMES = ['1d', '2d', '4d', '8d', '16d', '32d']
 
@@ -13,6 +13,15 @@ MINUTE_PERIODS = [1, 2, 4, 8]  # 对应 slot 聚合步长: 1(15m), 2(30m), 4(60m
 MINUTE_PERIOD_NAMES = ['15m', '30m', '60m', '120m']
 
 METRIC_COLS_TEMPLATE = ['sk_{p}', 'sd_{p}', 'skxl_{p}', 'sdxl_{p}', 'mk_{p}', 'md_{p}', 'mkxl_{p}', 'mdxl_{p}']
+
+# 严格匹配 schema.py 的物理表列顺序定义
+DAILY_SNAPSHOT_COLUMNS = [
+    'symbol', 'code', 'trade_date', 'bar_seq', 'open', 'high', 'low', 'close', 'volume', 'amount', 'adj_factor'
+] + [tmpl.format(p=p) for p in DAILY_PERIOD_NAMES for tmpl in METRIC_COLS_TEMPLATE]
+
+MINUTE_SNAPSHOT_COLUMNS = [
+    'symbol', 'code', 'trading_date', 'bar_end', 'slot_seq', 'open', 'high', 'low', 'close', 'volume', 'amount', 'adj_factor'
+] + [tmpl.format(p=p) for p in MINUTE_PERIOD_NAMES for tmpl in METRIC_COLS_TEMPLATE]
 
 
 @dataclass
@@ -333,6 +342,8 @@ class MultiCycleKDJEngine:
                 low_adj=res[11] if res[9] > 0 else None
             )
 
+        # 严格重排字段顺序，完全契合 schema 物理表定义，杜绝任何错位与冗余临时列
+        df = df[DAILY_SNAPSHOT_COLUMNS].copy()
         return df, out_states
 
     @staticmethod
@@ -398,9 +409,10 @@ class MultiCycleKDJEngine:
                 low_adj=res[11] if res[9] > 0 else None
             )
 
-        # 截取 >= cutoff_date 的行返回
+        # 截取 >= cutoff_date 的行返回，并严格按 schema 物理表定义重排字段
         if cutoff_date:
             cutoff_ts = pd.to_datetime(cutoff_date)
             df = df[pd.to_datetime(df['trading_date']) >= cutoff_ts].copy()
 
+        df = df[MINUTE_SNAPSHOT_COLUMNS].copy()
         return df, out_states

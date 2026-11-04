@@ -197,3 +197,65 @@ def test_period_state_serialization():
     assert np.isclose(restored.sd_closed, state.sd_closed)
     assert np.isclose(restored.mk_closed, state.mk_closed)
     assert np.isclose(restored.md_closed, state.md_closed)
+
+
+def test_column_alignment_and_by_name_insertion():
+    """测试阶段 2 核心修复: 严格物理列对齐与 DuckDB BY NAME 插入无错列断言"""
+    import duckdb
+    from src.schema import TABLES_DDL
+
+    mem_conn = duckdb.connect(":memory:")
+    mem_conn.execute(TABLES_DDL)
+
+    # 1. 测试日线数据列对齐
+    df_daily = generate_mock_daily_data(n_bars=50, seed=999)
+    # 打乱输入列顺序
+    cols_shuffled = ['adj_factor', 'volume', 'amount', 'symbol', 'code', 'close', 'open', 'high', 'low', 'trade_date']
+    df_daily_shuffled = df_daily[cols_shuffled].copy()
+
+    df_d_snap, _ = MultiCycleKDJEngine.compute_daily_snapshot(df_daily_shuffled)
+
+    # 使用 DuckDB 的 BY NAME 语法插入
+    mem_conn.register("df_d_snap", df_d_snap)
+    mem_conn.execute("INSERT INTO daily_snapshot BY NAME SELECT * FROM df_d_snap")
+    mem_conn.unregister("df_d_snap")
+
+    # 读回数据进行逐列严格断言
+    read_back_d = mem_conn.execute("""
+        SELECT symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor
+        FROM daily_snapshot
+        ORDER BY bar_seq ASC
+    """).df()
+
+    assert len(read_back_d) == len(df_daily)
+    # 严格断言 close, volume, bar_seq, adj_factor 无任何错位！
+    np.testing.assert_allclose(read_back_d['close'].to_numpy(), df_daily['close'].to_numpy(), rtol=1e-7)
+    np.testing.assert_allclose(read_back_d['volume'].to_numpy(), df_daily['volume'].to_numpy(), rtol=1e-7)
+    np.testing.assert_allclose(read_back_d['adj_factor'].to_numpy(), df_daily['adj_factor'].to_numpy(), rtol=1e-7)
+    np.testing.assert_array_equal(read_back_d['bar_seq'].to_numpy(), np.arange(50, dtype=np.int32))
+
+    # 2. 测试分钟线数据列对齐
+    df_minute = generate_mock_minute_data(n_days=5, seed=888)
+    cols_min_shuffled = ['close', 'open', 'volume', 'symbol', 'slot_seq', 'bar_end', 'trading_date', 'code', 'high', 'low', 'amount', 'adj_factor']
+    df_min_shuffled = df_minute[cols_min_shuffled].copy()
+
+    df_m_snap, _ = MultiCycleKDJEngine.compute_minute_snapshot(df_min_shuffled, cutoff_date=None)
+
+    mem_conn.register("df_m_snap", df_m_snap)
+    mem_conn.execute("INSERT INTO minute_snapshot BY NAME SELECT * FROM df_m_snap")
+    mem_conn.unregister("df_m_snap")
+
+    read_back_m = mem_conn.execute("""
+        SELECT symbol, code, trading_date, bar_end, slot_seq, open, high, low, close, volume, amount, adj_factor
+        FROM minute_snapshot
+        ORDER BY bar_end ASC
+    """).df()
+
+    assert len(read_back_m) == len(df_minute)
+    np.testing.assert_allclose(read_back_m['close'].to_numpy(), df_minute['close'].to_numpy(), rtol=1e-7)
+    np.testing.assert_allclose(read_back_m['volume'].to_numpy(), df_minute['volume'].to_numpy(), rtol=1e-7)
+    np.testing.assert_allclose(read_back_m['adj_factor'].to_numpy(), df_minute['adj_factor'].to_numpy(), rtol=1e-7)
+    np.testing.assert_array_equal(read_back_m['slot_seq'].to_numpy(), df_minute['slot_seq'].to_numpy())
+
+    mem_conn.close()
+
