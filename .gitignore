@@ -35,6 +35,11 @@ wheels/
 logs/
 *.log
 
+# Repomix
+repomix-output.*
+repomix-full-codebase.*
+repomix.config.json
+
 # Environment & IDE
 .env
 .env.*
