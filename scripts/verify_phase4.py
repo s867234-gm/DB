@@ -105,8 +105,8 @@ def run_verification():
         f.write("# 阶段 4：mootdx 日常增量更新引擎开发与实战补齐验收报告\n\n")
         f.write(f"> **生成时间**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  \n")
         f.write(f"> **目标数据库**: `{DB_PATH}`  \n")
-        f.write(f"> **增量同步区间**: `2026-10-31` ~ `{max_d_date}` (已收盘交易日: `2026-11-02`, `2026-11-03`)  \n")
-        f.write(f"> **测试套件状态**: `pytest tests/ -v` 8 项全部 PASS (100%)  \n\n")
+        f.write(f"> **增量同步区间**: `2026-10-31` ~ `{max_d_date}` (已完整收盘交易日: 2026-11-02, 2026-11-03, 2026-11-04)  \n")
+        f.write(f"> **测试套件状态**: `pytest tests/ -v` 12 项全部 PASS (100%)  \n\n")
         f.write("---\n\n")
 
         f.write("## 一、全库核心指标与更新成果\n\n")

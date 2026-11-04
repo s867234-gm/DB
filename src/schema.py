@@ -126,6 +126,10 @@ CREATE TABLE IF NOT EXISTS incremental_state (
     updated_at TIMESTAMP,
     PRIMARY KEY (symbol, period)
 );
+
+-- 常用辅助索引
+CREATE INDEX IF NOT EXISTS idx_security_code ON security_info (code);
+CREATE INDEX IF NOT EXISTS idx_corp_action_sym ON corporate_action (symbol, event_date);
 """
 
 VIEWS_DDL = """

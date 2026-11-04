@@ -119,14 +119,22 @@ def restore_state_from_db(con, symbol: str) -> Dict[str, PeriodState]:
 
 
 def states_to_df(states: List[PeriodState], updated_at=None) -> pd.DataFrame:
-    """将 PeriodState 列表转换为 incremental_state DataFrame"""
+    """将 PeriodState 列表转换为 incremental_state DataFrame（显式指定 dtype 避免拼接时产生 FutureWarning）"""
     cols = [
         "symbol", "period", "last_closed_bucket_id", "closed_highs_adj", "closed_lows_adj",
         "sk_closed", "sd_closed", "mk_closed", "md_closed", "last_valid_rsv13", "last_valid_rsv104",
         "bar_count", "high_adj", "low_adj", "updated_at"
     ]
+    if not states:
+        return pd.DataFrame(columns=cols)
     data = [st.to_db_row(updated_at=updated_at) for st in states]
-    return pd.DataFrame(data, columns=cols)
+    df = pd.DataFrame(data, columns=cols)
+    # 显式指定数值列类型
+    df["last_closed_bucket_id"] = df["last_closed_bucket_id"].astype("int64")
+    df["bar_count"] = df["bar_count"].astype("int32")
+    for float_col in ["sk_closed", "sd_closed", "mk_closed", "md_closed", "last_valid_rsv13", "last_valid_rsv104", "high_adj", "low_adj"]:
+        df[float_col] = pd.to_numeric(df[float_col], errors="coerce").astype("float64")
+    return df
 
 
 

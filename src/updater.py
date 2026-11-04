@@ -78,7 +78,7 @@ class DailyUpdater:
         try:
             # 1. 标的基本信息
             sec_df = con.execute("""
-                SELECT symbol, code, sec_type, latest_adj_factor
+                SELECT symbol, code, sec_type, delist_date, latest_adj_factor
                 FROM security_info
                 ORDER BY symbol
             """).df()
@@ -130,6 +130,12 @@ class DailyUpdater:
                     needs_minute = False
                 elif last_m == target_date and (not allow_intraday or last_slot >= 16):
                     needs_minute = False
+
+            # 若标的已退市且数据已更新至退市日或之后，则不再产生更新任务
+            delist_d = to_date(row.get("delist_date"))
+            if delist_d is not None and last_d is not None and last_d >= delist_d:
+                needs_daily = False
+                needs_minute = False
 
             if needs_daily or needs_minute:
                 tasks.append({
