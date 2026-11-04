@@ -85,14 +85,19 @@ class DailyUpdater:
 
             # 2. 当前日线最新进展
             d_df = con.execute("""
-                SELECT symbol, MAX(trade_date) AS last_d_date, MAX(bar_seq) AS last_bar_seq
+                SELECT symbol, 
+                       MAX(trade_date) AS last_d_date, 
+                       MAX(bar_seq) AS last_bar_seq,
+                       ARG_MAX(close, trade_date) AS last_close
                 FROM daily_snapshot
                 GROUP BY symbol
             """).df()
 
             # 3. 当前 15 分钟线最新进展
             m_df = con.execute("""
-                SELECT symbol, MAX(trading_date) AS last_m_date, MAX(slot_seq) AS last_m_slot
+                SELECT symbol, 
+                       MAX(trading_date) AS last_m_date, 
+                       ARG_MAX(slot_seq, bar_end) AS last_m_slot
                 FROM minute_snapshot
                 GROUP BY symbol
             """).df()
@@ -109,6 +114,7 @@ class DailyUpdater:
             sym = row["symbol"]
             last_d = to_date(row["last_d_date"])
             last_seq = int(row["last_bar_seq"]) if pd.notnull(row["last_bar_seq"]) else -1
+            last_close = float(row["last_close"]) if pd.notnull(row["last_close"]) else None
             last_m = to_date(row["last_m_date"])
             last_slot = int(row["last_m_slot"]) if pd.notnull(row["last_m_slot"]) else 0
             latest_adj = float(row["latest_adj_factor"]) if pd.notnull(row["latest_adj_factor"]) else 1.0
@@ -133,6 +139,7 @@ class DailyUpdater:
                     "latest_adj_factor": latest_adj,
                     "last_d_date": last_d,
                     "last_bar_seq": last_seq,
+                    "last_close": last_close,
                     "last_m_date": last_m,
                     "last_m_slot": last_slot,
                 })
@@ -154,13 +161,8 @@ class DailyUpdater:
         latest_adj = task["latest_adj_factor"]
         target_date = to_date(target_date)
 
-        # 1. 还原增量状态
-        con = duckdb.connect(self.db_path, read_only=True)
-        try:
-            states_dict = restore_state_from_db(con, sym)
-        finally:
-            con.close()
-
+        # 1. 还原增量状态 (从外部注入的 states_dict 中获取，避免子线程重复连接数据库)
+        states_dict = task.get("states_dict") or {}
         daily_states = {p: states_dict.get(p, PeriodState.initial(sym, p)) for p in DAILY_PERIOD_NAMES}
         minute_states = {p: states_dict.get(p, PeriodState.initial(sym, p)) for p in MINUTE_PERIOD_NAMES}
 
@@ -183,6 +185,7 @@ class DailyUpdater:
 
         # 4. 除权除息与 adj_factor 推进
         cur_adj = latest_adj
+        new_corp_actions = []
         if not df_new_d.empty and sec_type == "STOCK":
             # 检查是否有除权事件
             events = self.fetcher.fetch_xdxr_events(sym)
@@ -193,12 +196,24 @@ class DailyUpdater:
                     event_by_date[d_obj] = e
 
             adj_list = []
-            prev_c = df_new_d.iloc[0]["open"] # 保护兜底
+            prev_c = task.get("last_close")
+            if prev_c is None or prev_c <= 0:
+                prev_c = df_new_d.iloc[0]["open"] if not df_new_d.empty else 0.0
+
             for idx, r in df_new_d.iterrows():
                 t_date = r["trade_date"]
                 if t_date in event_by_date:
                     ev = event_by_date[t_date]
                     cur_adj = calculate_next_adj_factor(cur_adj, prev_c, ev)
+                    new_corp_actions.append({
+                        "symbol": sym,
+                        "event_date": t_date,
+                        "category": 1,
+                        "cash_dividend": float(ev.get("fenhong") or 0.0) / 10.0,
+                        "bonus_share": float(ev.get("songzhuangu") or 0.0) / 10.0,
+                        "rights_share": float(ev.get("peigu") or 0.0) / 10.0,
+                        "rights_price": float(ev.get("peigujia") or 0.0),
+                    })
                 adj_list.append(cur_adj)
                 prev_c = r["close"]
             df_new_d["adj_factor"] = adj_list
@@ -237,6 +252,7 @@ class DailyUpdater:
             "daily_snap": df_d_snap,
             "minute_snap": df_m_snap,
             "state_df": df_state,
+            "corp_actions": new_corp_actions,
         }
 
     def run_update(
@@ -282,6 +298,30 @@ class DailyUpdater:
             batch_tasks = tasks[batch_idx : batch_idx + batch_size]
             batch_results = []
 
+            # 主线程预先单 SQL 批量读取该批次全部 symbol 的 incremental_state，避免子线程频繁连接
+            batch_symbols = [t["symbol"] for t in batch_tasks]
+            con_st = duckdb.connect(self.db_path, read_only=True)
+            try:
+                con_st.register("tmp_batch_syms", pd.DataFrame({"symbol": batch_symbols}))
+                st_rows = con_st.execute("""
+                    SELECT s.symbol, s.period, s.last_closed_bucket_id, s.closed_highs_adj, s.closed_lows_adj,
+                           s.sk_closed, s.sd_closed, s.mk_closed, s.md_closed, s.last_valid_rsv13, s.last_valid_rsv104,
+                           s.bar_count, s.high_adj, s.low_adj, s.updated_at
+                    FROM incremental_state s
+                    JOIN tmp_batch_syms b ON s.symbol = b.symbol
+                """).fetchall()
+                con_st.unregister("tmp_batch_syms")
+            finally:
+                con_st.close()
+
+            states_by_sym = {}
+            for r in st_rows:
+                st_obj = PeriodState.from_db_row(r)
+                states_by_sym.setdefault(st_obj.symbol, {})[st_obj.period] = st_obj
+
+            for t in batch_tasks:
+                t["states_dict"] = states_by_sym.get(t["symbol"], {})
+
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = {
                     executor.submit(self.process_symbol, t, target_date): t
@@ -303,10 +343,15 @@ class DailyUpdater:
             d_list = [r["daily_snap"] for r in batch_results if not r["daily_snap"].empty]
             m_list = [r["minute_snap"] for r in batch_results if not r["minute_snap"].empty]
             s_list = [r["state_df"] for r in batch_results if not r["state_df"].empty]
+            ca_list = []
+            for r in batch_results:
+                if r.get("corp_actions"):
+                    ca_list.extend(r["corp_actions"])
 
             b_df_d = pd.concat(d_list, ignore_index=True) if d_list else pd.DataFrame()
             b_df_m = pd.concat(m_list, ignore_index=True) if m_list else pd.DataFrame()
             b_df_s = pd.concat(s_list, ignore_index=True) if s_list else pd.DataFrame()
+            b_df_ca = pd.DataFrame(ca_list) if ca_list else pd.DataFrame()
 
             # 写入 DuckDB (原子事务 + BY NAME)
             con = duckdb.connect(self.db_path)
@@ -336,6 +381,13 @@ class DailyUpdater:
                         "INSERT OR REPLACE INTO incremental_state BY NAME SELECT * FROM tmp_batch_state"
                     )
                     con.unregister("tmp_batch_state")
+
+                if not b_df_ca.empty:
+                    con.register("tmp_batch_ca", b_df_ca)
+                    con.execute(
+                        "INSERT OR IGNORE INTO corporate_action BY NAME SELECT * FROM tmp_batch_ca"
+                    )
+                    con.unregister("tmp_batch_ca")
 
                 # 更新 security_info 的 latest_adj_factor 与 updated_at
                 for r in batch_results:

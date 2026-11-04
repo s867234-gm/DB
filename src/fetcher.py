@@ -247,6 +247,16 @@ class TdxFetcher:
             return []
 
 
+def is_stock_symbol(symbol: str) -> bool:
+    """判定是否为个股（非指数）。个股成交量通达信以股返回，需除以 100 换算为手；指数无需除以 100。"""
+    s = str(symbol).strip().upper()
+    if s.startswith("TDX") or s.startswith("SH000") or s.startswith("SH001") or s.startswith("SZ399"):
+        return False
+    if s.startswith("880") or s.startswith("399"):
+        return False
+    return True
+
+
 def parse_daily_bars_to_df(
     symbol: str, raw_bars: List[Dict], min_trade_date: Optional[datetime.date] = None
 ) -> pd.DataFrame:
@@ -255,6 +265,8 @@ def parse_daily_bars_to_df(
     """
     if not raw_bars:
         return pd.DataFrame()
+
+    vol_divider = 100.0 if is_stock_symbol(symbol) else 1.0
 
     records = []
     for b in raw_bars:
@@ -268,7 +280,7 @@ def parse_daily_bars_to_df(
             "high": float(b["high"]),
             "low": float(b["low"]),
             "close": float(b["close"]),
-            "volume": float(b["vol"]),
+            "volume": float(b["vol"]) / vol_divider,
             "amount": float(b["amount"]),
         })
 
@@ -291,6 +303,8 @@ def parse_minute_bars_to_df(
     """
     if not raw_bars:
         return pd.DataFrame()
+
+    vol_divider = 100.0 if is_stock_symbol(symbol) else 1.0
 
     records = []
     for b in raw_bars:
@@ -331,7 +345,7 @@ def parse_minute_bars_to_df(
             "high": float(b["high"]),
             "low": float(b["low"]),
             "close": float(b["close"]),
-            "volume": float(b["vol"]),
+            "volume": float(b["vol"]) / vol_divider,
             "amount": float(b["amount"]),
         })
 

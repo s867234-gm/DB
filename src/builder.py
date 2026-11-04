@@ -180,7 +180,7 @@ class FullMarketBuilder:
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = [executor.submit(self._compute_single_symbol, t[0], t[1], t[2]) for t in tasks]
-            for f in futures:
+            for (s_dict, _, _), f in zip(tasks, futures):
                 d_snap, m_snap, inc_rows, latest_adj = f.result()
                 if d_snap is not None and len(d_snap) > 0:
                     d_snap_list.append(d_snap)

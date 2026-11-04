@@ -167,3 +167,84 @@ def test_updater_idempotence(tmp_path):
 
     assert count_after_2nd == count_after_1st
     assert states_after_2nd == states_after_1st
+
+
+def test_updater_intraday_progression(tmp_path):
+    """测试盘中多次增量更新（例如上午先更新 slot 1~4，下午再更新 slot 5~8，总行数正确追加为 8 行）"""
+    db_file = str(tmp_path / "test_intraday.duckdb")
+    con = duckdb.connect(db_file)
+    create_tables(con)
+    con.execute("""
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, board, latest_adj_factor)
+        VALUES ('SZ000001', '000001', '平安银行', 'STOCK', 'SZSE', 'MAIN', 1.0)
+    """)
+    # 插入前一日 10 根日线与初始状态
+    dates = pd.date_range("2026-10-01", periods=10, freq="B").date
+    initial_daily_rows = [{
+        "symbol": "SZ000001",
+        "code": "000001",
+        "trade_date": d,
+        "bar_seq": i,
+        "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.2,
+        "volume": 1000.0, "amount": 10200.0, "adj_factor": 1.0,
+    } for i, d in enumerate(dates)]
+    df_init_d = pd.DataFrame(initial_daily_rows)
+    df_init_d_snap, d_states = MultiCycleKDJEngine.compute_daily_snapshot(df_init_d)
+    con.register("tmp_init_d", df_init_d_snap)
+    con.execute("INSERT INTO daily_snapshot BY NAME SELECT * FROM tmp_init_d")
+
+    df_init_states = states_to_df(list(d_states.values()))
+    con.register("tmp_init_s", df_init_states)
+    con.execute("INSERT INTO incremental_state BY NAME SELECT * FROM tmp_init_s")
+    con.close()
+
+    # 1. 模拟上午盘中 (达到 slot 4: 10:30)
+    target_date = datetime.date(2026, 10, 16)
+    mock_fetcher = MagicMock()
+    mock_fetcher.get_latest_market_status.return_value = (target_date, False)  # 盘中未收盘
+    mock_fetcher.fetch_xdxr_events.return_value = []
+    mock_fetcher.fetch_daily_bars.return_value = []
+
+    morning_slots = [
+        {"datetime": "2026-10-16 09:45", "open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "vol": 10000, "amount": 101000},
+        {"datetime": "2026-10-16 10:00", "open": 10.1, "high": 10.3, "low": 10.0, "close": 10.2, "vol": 10000, "amount": 102000},
+        {"datetime": "2026-10-16 10:15", "open": 10.2, "high": 10.4, "low": 10.1, "close": 10.3, "vol": 10000, "amount": 103000},
+        {"datetime": "2026-10-16 10:30", "open": 10.3, "high": 10.5, "low": 10.2, "close": 10.4, "vol": 10000, "amount": 104000},
+    ]
+    mock_fetcher.fetch_minute_bars.return_value = morning_slots
+
+    updater = DailyUpdater(db_path=db_file, fetcher=mock_fetcher)
+    res1 = updater.run_update(allow_intraday=True)
+    assert res1["status"] == "SUCCESS"
+    assert res1["minute_rows_added"] == 4
+
+    con = duckdb.connect(db_file, read_only=True)
+    m_count_1 = con.execute("SELECT COUNT(*) FROM minute_snapshot WHERE symbol = 'SZ000001'").fetchone()[0]
+    last_slot_1 = con.execute("SELECT ARG_MAX(slot_seq, bar_end) FROM minute_snapshot WHERE symbol = 'SZ000001'").fetchone()[0]
+    con.close()
+    assert m_count_1 == 4
+    assert last_slot_1 == 4
+
+    # 2. 模拟下午盘中 (推进至 slot 8: 11:30)
+    afternoon_slots = morning_slots + [
+        {"datetime": "2026-10-16 10:45", "open": 10.4, "high": 10.6, "low": 10.3, "close": 10.5, "vol": 10000, "amount": 105000},
+        {"datetime": "2026-10-16 11:00", "open": 10.5, "high": 10.7, "low": 10.4, "close": 10.6, "vol": 10000, "amount": 106000},
+        {"datetime": "2026-10-16 11:15", "open": 10.6, "high": 10.8, "low": 10.5, "close": 10.7, "vol": 10000, "amount": 107000},
+        {"datetime": "2026-10-16 11:30", "open": 10.7, "high": 10.9, "low": 10.6, "close": 10.8, "vol": 10000, "amount": 108000},
+    ]
+    mock_fetcher.fetch_minute_bars.return_value = afternoon_slots
+
+    res2 = updater.run_update(allow_intraday=True)
+    assert res2["status"] == "SUCCESS"
+    assert res2["minute_rows_added"] == 4
+
+    con = duckdb.connect(db_file, read_only=True)
+    m_count_2 = con.execute("SELECT COUNT(*) FROM minute_snapshot WHERE symbol = 'SZ000001'").fetchone()[0]
+    last_slot_2 = con.execute("SELECT ARG_MAX(slot_seq, bar_end) FROM minute_snapshot WHERE symbol = 'SZ000001'").fetchone()[0]
+    slots = [r[0] for r in con.execute("SELECT slot_seq FROM minute_snapshot WHERE symbol = 'SZ000001' ORDER BY slot_seq").fetchall()]
+    con.close()
+
+    assert m_count_2 == 8
+    assert last_slot_2 == 8
+    assert slots == [1, 2, 3, 4, 5, 6, 7, 8]
+
