@@ -1,0 +1,169 @@
+# -*- coding: utf-8 -*-
+"""
+tests/test_updater.py —— 增量更新引擎单元测试与幂等性校验
+"""
+
+import datetime
+from unittest.mock import MagicMock
+
+import duckdb
+import numpy as np
+import pandas as pd
+import pytest
+
+from src.fetcher import (
+    calculate_next_adj_factor,
+    parse_daily_bars_to_df,
+    parse_minute_bars_to_df,
+)
+from src.kdj_engine import (
+    DAILY_PERIOD_NAMES,
+    DAILY_SNAPSHOT_COLUMNS,
+    MINUTE_PERIOD_NAMES,
+    MINUTE_SNAPSHOT_COLUMNS,
+    MultiCycleKDJEngine,
+    PeriodState,
+    restore_state_from_db,
+    states_to_df,
+)
+from src.schema import create_tables
+from src.updater import DailyUpdater
+
+
+def test_calculate_next_adj_factor():
+    """测试除权除息等比复权因子推进计算"""
+    prev_close = 10.0
+    prev_factor = 1.5
+
+    # 1. 无事件
+    assert calculate_next_adj_factor(prev_factor, prev_close, None) == 1.5
+    assert calculate_next_adj_factor(prev_factor, prev_close, {}) == 1.5
+
+    # 2. 纯分红派息: 每10股派2元 (每股0.2元)
+    event_div = {"fenhong": 2.0, "songzhuangu": 0.0, "peigu": 0.0, "peigujia": 0.0}
+    # 除权参考价: (10.0 - 0.2) / 1.0 = 9.8
+    # ratio = 10.0 / 9.8 = 1.020408163
+    new_factor = calculate_next_adj_factor(prev_factor, prev_close, event_div)
+    expected = 1.5 * (10.0 / 9.8)
+    assert abs(new_factor - expected) < 1e-6
+    assert new_factor > prev_factor
+
+    # 3. 送转股: 每10股送转2股 (s=0.2)
+    event_bonus = {"fenhong": 0.0, "songzhuangu": 2.0, "peigu": 0.0, "peigujia": 0.0}
+    # 除权参考价: 10.0 / (1 + 0.2) = 10.0 / 1.2 = 8.333333
+    # ratio = 10.0 / 8.333333 = 1.2
+    new_factor_bonus = calculate_next_adj_factor(prev_factor, prev_close, event_bonus)
+    assert abs(new_factor_bonus - 1.5 * 1.2) < 1e-6
+
+
+def test_parse_and_filter_bars():
+    """测试日线与 15 分钟线数据解析及槽位对齐"""
+    raw_d = [
+        {"datetime": "2026-10-30", "open": 10.0, "high": 10.5, "low": 9.8, "close": 10.2, "vol": 1000, "amount": 10200},
+        {"datetime": "2026-11-02", "open": 10.3, "high": 10.8, "low": 10.1, "close": 10.6, "vol": 1200, "amount": 12720},
+    ]
+
+    # 不带过滤
+    df_d = parse_daily_bars_to_df("SZ000001", raw_d)
+    assert len(df_d) == 2
+
+    # 带 min_trade_date 过滤
+    df_d_filtered = parse_daily_bars_to_df("SZ000001", raw_d, min_trade_date=datetime.date(2026, 10, 30))
+    assert len(df_d_filtered) == 1
+    assert df_d_filtered.iloc[0]["trade_date"] == datetime.date(2026, 11, 2)
+
+    # 15分钟线槽位解析
+    raw_m = [
+        {"datetime": "2026-11-02 09:45", "open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "vol": 100, "amount": 1010},
+        {"datetime": "2026-11-02 10:00", "open": 10.1, "high": 10.3, "low": 10.0, "close": 10.2, "vol": 100, "amount": 1020},
+        {"datetime": "2026-11-02 15:00", "open": 10.5, "high": 10.6, "low": 10.4, "close": 10.6, "vol": 200, "amount": 2120},
+    ]
+    df_m = parse_minute_bars_to_df("SZ000001", raw_m)
+    assert len(df_m) == 3
+    assert df_m.iloc[0]["slot_seq"] == 1
+    assert df_m.iloc[1]["slot_seq"] == 2
+    assert df_m.iloc[2]["slot_seq"] == 16
+    assert df_m.iloc[2]["bar_end"] == datetime.datetime(2026, 11, 2, 15, 0)
+
+
+def test_updater_idempotence(tmp_path):
+    """测试增量更新的幂等性：连续两次更新同一批数据，行数零增加且状态保持一致"""
+    db_file = str(tmp_path / "test_idempotent.duckdb")
+    con = duckdb.connect(db_file)
+    create_tables(con)
+    con.execute("""
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, board, latest_adj_factor)
+        VALUES ('SZ000001', '000001', '平安银行', 'STOCK', 'SZSE', 'MAIN', 1.0)
+    """)
+
+    # 初始 10 根日线
+    dates = pd.date_range("2026-10-01", periods=10, freq="B").date
+    initial_daily_rows = []
+    for i, d in enumerate(dates):
+        initial_daily_rows.append({
+            "symbol": "SZ000001",
+            "code": "000001",
+            "trade_date": d,
+            "bar_seq": i,
+            "open": 10.0 + i * 0.1,
+            "high": 10.5 + i * 0.1,
+            "low": 9.5 + i * 0.1,
+            "close": 10.2 + i * 0.1,
+            "volume": 10000.0,
+            "amount": 102000.0,
+            "adj_factor": 1.0,
+        })
+    df_init_d = pd.DataFrame(initial_daily_rows)
+    df_init_d_snap, d_states = MultiCycleKDJEngine.compute_daily_snapshot(df_init_d)
+
+    con.register("tmp_init_d", df_init_d_snap)
+    con.execute("INSERT INTO daily_snapshot BY NAME SELECT * FROM tmp_init_d")
+
+    # 保存初始 incremental_state
+    df_init_states = states_to_df(list(d_states.values()))
+    con.register("tmp_init_s", df_init_states)
+    con.execute("INSERT INTO incremental_state BY NAME SELECT * FROM tmp_init_s")
+    con.close()
+
+    # 2. 模拟 Fetcher 返回 2 根新增日线 (2026-10-15, 2026-10-16)
+    target_date = datetime.date(2026, 10, 16)
+    mock_fetcher = MagicMock()
+    mock_fetcher.get_latest_market_status.return_value = (target_date, True)
+    mock_fetcher.fetch_xdxr_events.return_value = []
+    mock_fetcher.fetch_minute_bars.return_value = []
+
+    mock_daily_bars = [
+        {"datetime": "2026-10-14", "open": 11.0, "high": 11.2, "low": 10.8, "close": 11.1, "vol": 1000, "amount": 11100},
+        {"datetime": "2026-10-15", "open": 11.2, "high": 11.5, "low": 11.0, "close": 11.4, "vol": 1200, "amount": 13680},
+        {"datetime": "2026-10-16", "open": 11.5, "high": 11.8, "low": 11.3, "close": 11.7, "vol": 1500, "amount": 17550},
+    ]
+    mock_fetcher.fetch_daily_bars.return_value = mock_daily_bars
+
+    updater = DailyUpdater(db_path=db_file, fetcher=mock_fetcher)
+
+    # 第一次运行增量更新
+    res1 = updater.run_update(allow_intraday=False)
+    assert res1["status"] == "SUCCESS"
+    assert res1["symbols_updated"] == 1
+    assert res1["daily_rows_added"] == 2
+
+    # 验证库内总行数
+    con = duckdb.connect(db_file, read_only=True)
+    count_after_1st = con.execute("SELECT COUNT(*) FROM daily_snapshot WHERE symbol = 'SZ000001'").fetchone()[0]
+    states_after_1st = con.execute("SELECT period, sk_closed, sd_closed, mk_closed, md_closed, bar_count FROM incremental_state WHERE symbol = 'SZ000001'").fetchall()
+    con.close()
+    assert count_after_1st == 12
+
+    # 第二次运行增量更新（相同 target_date）
+    res2 = updater.run_update(allow_intraday=False)
+    # 应直接跳过已是最新的标的
+    assert res2["status"] == "SKIPPED_ALREADY_UP_TO_DATE" or res2["symbols_updated"] == 0
+
+    # 验证行数零增加，状态完全不变
+    con = duckdb.connect(db_file, read_only=True)
+    count_after_2nd = con.execute("SELECT COUNT(*) FROM daily_snapshot WHERE symbol = 'SZ000001'").fetchone()[0]
+    states_after_2nd = con.execute("SELECT period, sk_closed, sd_closed, mk_closed, md_closed, bar_count FROM incremental_state WHERE symbol = 'SZ000001'").fetchall()
+    con.close()
+
+    assert count_after_2nd == count_after_1st
+    assert states_after_2nd == states_after_1st

@@ -102,6 +102,34 @@ class PeriodState:
         )
 
 
+def restore_state_from_db(con, symbol: str) -> Dict[str, PeriodState]:
+    """从数据库 incremental_state 还原指定标的的全套 PeriodState"""
+    rows = con.execute("""
+        SELECT symbol, period, last_closed_bucket_id, closed_highs_adj, closed_lows_adj,
+               sk_closed, sd_closed, mk_closed, md_closed, last_valid_rsv13, last_valid_rsv104,
+               bar_count, high_adj, low_adj, updated_at
+        FROM incremental_state
+        WHERE symbol = ?
+    """, [symbol]).fetchall()
+    states = {}
+    for r in rows:
+        st = PeriodState.from_db_row(r)
+        states[st.period] = st
+    return states
+
+
+def states_to_df(states: List[PeriodState], updated_at=None) -> pd.DataFrame:
+    """将 PeriodState 列表转换为 incremental_state DataFrame"""
+    cols = [
+        "symbol", "period", "last_closed_bucket_id", "closed_highs_adj", "closed_lows_adj",
+        "sk_closed", "sd_closed", "mk_closed", "md_closed", "last_valid_rsv13", "last_valid_rsv104",
+        "bar_count", "high_adj", "low_adj", "updated_at"
+    ]
+    data = [st.to_db_row(updated_at=updated_at) for st in states]
+    return pd.DataFrame(data, columns=cols)
+
+
+
 @nb.njit(fastmath=True)
 def _compute_period_kdj_numba(
     high_adj: np.ndarray,

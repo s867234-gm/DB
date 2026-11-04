@@ -1,0 +1,377 @@
+# -*- coding: utf-8 -*-
+"""
+src/fetcher.py —— 通达信 (TDX) 高可用行情与除权数据采集器
+
+功能：
+1. 内置实测可用的券商自建主站列表，支持自动验活与故障切换。
+2. 判定最新完整收盘交易日（默认仅更新已走完 15:00 的交易日）。
+3. 支持个股、宽基指数、通达信行业指数（880xxx）的日线与 15 分钟线拉取。
+4. 严格对齐 15 分钟线槽位（1 ~ 16）与标准时间戳（09:45:00 ~ 15:00:00）。
+5. 采集除权除息信息并计算等比前复权因子推进。
+"""
+
+import datetime
+import logging
+import threading
+import time
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+from pytdx.hq import TdxHq_API
+
+logger = logging.getLogger("fetcher")
+
+# 实测高可用券商自建主站列表（按延迟与稳定性排序）
+BACKUP_SERVERS: List[Tuple[str, int, str]] = [
+    ("39.108.166.99", 7709, "华泰证券-华南1"),
+    ("47.106.36.3", 7709, "华泰证券-华南2"),
+    ("59.36.5.11", 7709, "安信证券15"),
+    ("180.101.48.170", 7709, "华泰证券-南京电信1"),
+    ("180.101.48.171", 7709, "华泰证券-南京电信2"),
+    ("117.34.114.20", 7709, "国泰君安13"),
+    ("117.34.114.27", 7709, "国泰君安14"),
+    ("122.96.107.242", 7709, "华泰证券-南京联通1"),
+    ("120.195.71.159", 7709, "华泰证券-南京移动4"),
+]
+
+# 15分钟线标准槽位时间映射 (1 ~ 16)
+STANDARD_15M_SLOTS: List[Tuple[int, str]] = [
+    (1, "09:45:00"),
+    (2, "10:00:00"),
+    (3, "10:15:00"),
+    (4, "10:30:00"),
+    (5, "10:45:00"),
+    (6, "11:00:00"),
+    (7, "11:15:00"),
+    (8, "11:30:00"),
+    (9, "13:15:00"),
+    (10, "13:30:00"),
+    (11, "13:45:00"),
+    (12, "14:00:00"),
+    (13, "14:15:00"),
+    (14, "14:30:00"),
+    (15, "14:45:00"),
+    (16, "15:00:00"),
+]
+TIME_TO_SLOT: Dict[str, int] = {t: s for s, t in STANDARD_15M_SLOTS}
+
+
+def parse_symbol(symbol: str) -> Tuple[int, str, bool]:
+    """解析系统 symbol 转换为通达信 market 与 code。
+    返回: (market, code, is_index)
+    - SH000001: (1, '000001', True)
+    - SZ399005: (0, '399005', True)
+    - TDX880301: (1, '880301', True)
+    - SH600000: (1, '600000', False)
+    - SZ000001: (0, '000001', False)
+    """
+    s = str(symbol).strip().upper()
+    if s.startswith("TDX"):
+        code = s[3:]
+        return 1, code, True
+    elif s.startswith("SH"):
+        code = s[2:]
+        is_idx = code.startswith("000") or code.startswith("001")
+        return 1, code, is_idx
+    elif s.startswith("SZ"):
+        code = s[2:]
+        is_idx = code.startswith("399")
+        return 0, code, is_idx
+    else:
+        # 兼容纯数字
+        if s.startswith("6"):
+            return 1, s, False
+        elif s.startswith("880"):
+            return 1, s, True
+        elif s.startswith("000") and len(s) == 6:
+            return 0, s, False
+        elif s.startswith("399"):
+            return 0, s, True
+        else:
+            return 0, s, False
+
+
+class TdxConnectionPool:
+    """管理与通达信服务器的连接池与故障切换"""
+
+    _instance = None
+    _lock = threading.Lock()
+
+    def __init__(self, servers=None):
+        self.servers = list(servers or BACKUP_SERVERS)
+        self._local = threading.local()
+
+    @classmethod
+    def get_instance(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = TdxConnectionPool()
+            return cls._instance
+
+    def get_client(self) -> TdxHq_API:
+        """获取当前线程绑定的可用 TdxHq_API 实例，失败时自动故障切换"""
+        if hasattr(self._local, "api") and self._local.api is not None:
+            # 简单心跳验证
+            try:
+                if self._local.api.client is not None:
+                    return self._local.api
+            except Exception:
+                pass
+
+        # 重新建立连接
+        api = TdxHq_API(heartbeat=False)
+        for ip, port, name in self.servers:
+            try:
+                if api.connect(ip, port, time_out=2.0):
+                    # 快速验证是否能取到测试 bar
+                    test = api.get_security_bars(4, 0, "000001", 0, 1)
+                    if test is not None:
+                        self._local.api = api
+                        self._local.server = (ip, port, name)
+                        return api
+                api.disconnect()
+            except Exception:
+                try:
+                    api.disconnect()
+                except Exception:
+                    pass
+
+        raise RuntimeError("无法连接任何通达信可用行情服务器，请检查网络！")
+
+    def disconnect_thread(self):
+        if hasattr(self._local, "api") and self._local.api is not None:
+            try:
+                self._local.api.disconnect()
+            except Exception:
+                pass
+            self._local.api = None
+
+
+class TdxFetcher:
+    """通达信行情与除权增量数据采集器"""
+
+    def __init__(self, pool: Optional[TdxConnectionPool] = None):
+        self.pool = pool or TdxConnectionPool.get_instance()
+
+    def get_latest_market_status(self, allow_intraday: bool = False) -> Tuple[datetime.date, bool]:
+        """识别最新交易日及收盘状态。
+        通过拉取上证指数 SH000001 的日线与 15 分钟线判定：
+        - 若 15 分钟线最后一条达到 15:00:00，则该日完整收盘；
+        - 若未达到 15:00:00 且 allow_intraday=False，则回退为上一个完整交易日；
+        - 返回 (target_trade_date, is_closed)
+        """
+        api = self.pool.get_client()
+        # 上证指数日线与 15 分钟线
+        idx_daily = api.get_index_bars(4, 1, "000001", 0, 5)
+        idx_min15 = api.get_index_bars(1, 1, "000001", 0, 16)
+
+        if not idx_daily:
+            raise RuntimeError("无法获取上证指数行情以确认市场状态")
+
+        latest_day_str = idx_daily[-1]["datetime"][:10]
+        latest_day = datetime.datetime.strptime(latest_day_str, "%Y-%m-%d").date()
+
+        # 检查最新交易日是否已完整收盘（15分钟线最后一条达到 15:00）
+        is_closed = False
+        if idx_min15:
+            last_min = idx_min15[-1]
+            last_min_dt = last_min["datetime"]
+            if last_min_dt.startswith(latest_day_str) and (
+                last_min_dt.endswith("15:00") or last_min.get("hour") == 15
+            ):
+                is_closed = True
+
+        if not is_closed and not allow_intraday:
+            # 当天尚未走完 15:00 且不允许盘中更新，则最新收盘日为前一个交易日
+            if len(idx_daily) >= 2:
+                prev_day_str = idx_daily[-2]["datetime"][:10]
+                prev_day = datetime.datetime.strptime(prev_day_str, "%Y-%m-%d").date()
+                return prev_day, True
+            return latest_day, False
+
+        return latest_day, is_closed
+
+    def fetch_daily_bars(
+        self, symbol: str, sec_type: str, offset: int = 15
+    ) -> List[Dict]:
+        """获取标的最新日线行情。
+        返回原始 dict 列表，字段包含 open, high, low, close, vol, amount, datetime 等
+        """
+        market, code, is_idx = parse_symbol(symbol)
+        for retry in range(2):
+            try:
+                api = self.pool.get_client()
+                if is_idx or sec_type in ("BROAD_INDEX", "INDUSTRY_INDEX"):
+                    bars = api.get_index_bars(4, market, code, 0, offset)
+                else:
+                    bars = api.get_security_bars(4, market, code, 0, offset)
+                return bars or []
+            except Exception:
+                self.pool.disconnect_thread()
+                if retry == 1:
+                    logger.warning(f"{symbol} 拉取日线失败")
+                    return []
+
+    def fetch_minute_bars(
+        self, symbol: str, sec_type: str, offset: int = 48
+    ) -> List[Dict]:
+        """获取标的最新 15 分钟线行情。
+        通达信 category: 1 为 15 分钟线
+        """
+        market, code, is_idx = parse_symbol(symbol)
+        for retry in range(2):
+            try:
+                api = self.pool.get_client()
+                if is_idx or sec_type in ("BROAD_INDEX", "INDUSTRY_INDEX"):
+                    bars = api.get_index_bars(1, market, code, 0, offset)
+                else:
+                    bars = api.get_security_bars(1, market, code, 0, offset)
+                return bars or []
+            except Exception:
+                self.pool.disconnect_thread()
+                if retry == 1:
+                    logger.warning(f"{symbol} 拉取分钟线失败")
+                    return []
+
+    def fetch_xdxr_events(self, symbol: str) -> List[Dict]:
+        """获取除权除息及股本变动事件"""
+        market, code, is_idx = parse_symbol(symbol)
+        if is_idx:
+            return []
+        api = self.pool.get_client()
+        try:
+            items = api.get_xdxr_info(market, code)
+            return items or []
+        except Exception as e:
+            logger.warning(f"{symbol} 拉取除权除息失败: {e}")
+            return []
+
+
+def parse_daily_bars_to_df(
+    symbol: str, raw_bars: List[Dict], min_trade_date: Optional[datetime.date] = None
+) -> pd.DataFrame:
+    """将通达信日线原始列表解析为 DataFrame，并按日期升序排列。
+    若传入 min_trade_date，则仅保留 trade_date > min_trade_date 的行。
+    """
+    if not raw_bars:
+        return pd.DataFrame()
+
+    records = []
+    for b in raw_bars:
+        dt_str = b["datetime"][:10]
+        t_date = datetime.datetime.strptime(dt_str, "%Y-%m-%d").date()
+        if min_trade_date is not None and t_date <= min_trade_date:
+            continue
+        records.append({
+            "trade_date": t_date,
+            "open": float(b["open"]),
+            "high": float(b["high"]),
+            "low": float(b["low"]),
+            "close": float(b["close"]),
+            "volume": float(b["vol"]),
+            "amount": float(b["amount"]),
+        })
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    df = df.sort_values("trade_date").reset_index(drop=True)
+    return df
+
+
+def parse_minute_bars_to_df(
+    symbol: str,
+    raw_bars: List[Dict],
+    min_trade_date: Optional[datetime.date] = None,
+    min_slot_seq: Optional[int] = None,
+) -> pd.DataFrame:
+    """将通达信 15 分钟线解析为标准 16 槽位 DataFrame。
+    返回字段包含: trading_date, bar_end, slot_seq, open, high, low, close, volume, amount
+    """
+    if not raw_bars:
+        return pd.DataFrame()
+
+    records = []
+    for b in raw_bars:
+        dt_str = b["datetime"]  # '2026-11-03 09:45'
+        parts = dt_str.split()
+        if len(parts) != 2:
+            continue
+        d_str, t_str = parts[0], parts[1]
+        t_date = datetime.datetime.strptime(d_str, "%Y-%m-%d").date()
+
+        # 对齐时间字符串为 HH:MM:00
+        if len(t_str) == 5:
+            t_str = t_str + ":00"
+
+        slot = TIME_TO_SLOT.get(t_str)
+        if slot is None:
+            # 容错：个别情况 13:00 归为 13:15
+            if t_str == "13:00:00":
+                t_str = "13:15:00"
+                slot = 9
+            else:
+                continue
+
+        # 过滤已入库的 slot
+        if min_trade_date is not None:
+            if t_date < min_trade_date:
+                continue
+            if t_date == min_trade_date and min_slot_seq is not None and slot <= min_slot_seq:
+                continue
+
+        bar_end_dt = datetime.datetime.strptime(f"{d_str} {t_str}", "%Y-%m-%d %H:%M:%S")
+
+        records.append({
+            "trading_date": t_date,
+            "bar_end": bar_end_dt,
+            "slot_seq": slot,
+            "open": float(b["open"]),
+            "high": float(b["high"]),
+            "low": float(b["low"]),
+            "close": float(b["close"]),
+            "volume": float(b["vol"]),
+            "amount": float(b["amount"]),
+        })
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    # 严格按 trading_date, slot_seq 排序
+    df = df.sort_values(["trading_date", "slot_seq"]).reset_index(drop=True)
+    return df
+
+
+def calculate_next_adj_factor(
+    prev_adj_factor: float,
+    prev_close: float,
+    event: Optional[Dict],
+) -> float:
+    """根据除权事件计算新复权因子。
+    等比前复权公式:
+    new_factor = prev_factor * (prev_close / ex_right_ref_price)
+    """
+    if not event or prev_close <= 0:
+        return prev_adj_factor
+
+    fenhong = float(event.get("fenhong") or 0.0)      # 每10股派息
+    songzhuan = float(event.get("songzhuangu") or 0.0) # 每10股送转股
+    peigu = float(event.get("peigu") or 0.0)          # 每10股配股
+    peigujia = float(event.get("peigujia") or 0.0)    # 配股价
+
+    d = fenhong / 10.0
+    s = songzhuan / 10.0
+    p = peigu / 10.0
+
+    denom = 1.0 + s + p
+    if denom <= 0:
+        return prev_adj_factor
+
+    ref_price = (prev_close - d + p * peigujia) / denom
+    if ref_price <= 0.0001:
+        return prev_adj_factor
+
+    ratio = prev_close / ref_price
+    return prev_adj_factor * ratio
