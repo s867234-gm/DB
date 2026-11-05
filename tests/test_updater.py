@@ -410,3 +410,250 @@ def test_multi_day_ex_dividend_minute_adj_factor_mapping(tmp_path):
         assert abs(fac - expected_new_adj) < 1e-6
         assert fac > 1.0
 
+
+def test_intraday_unclosed_bar_filtered_and_post_market_resumes(tmp_path, monkeypatch):
+    """测试盘中未走完 15m K 线被自动拦截，且盘后无缝续接并与一次性全天更新严格一致"""
+    # 1. 初始化数据库与历史数据（截至 2026-10-15）
+    db_file = str(tmp_path / "test_unclosed.duckdb")
+    con = duckdb.connect(db_file)
+    create_tables(con)
+    con.execute("""
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, board, latest_adj_factor)
+        VALUES ('SZ000001', '000001', '平安银行', 'STOCK', 'SZSE', 'MAIN', 1.0)
+    """)
+    dates = pd.date_range("2026-10-01", "2026-10-15", freq="B").date
+    initial_daily_rows = [{
+        "symbol": "SZ000001", "code": "000001", "trade_date": d, "bar_seq": i,
+        "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.2,
+        "volume": 1000.0, "amount": 10200.0, "adj_factor": 1.0,
+    } for i, d in enumerate(dates)]
+    df_init_d = pd.DataFrame(initial_daily_rows)
+    df_init_d_snap, d_states = MultiCycleKDJEngine.compute_daily_snapshot(df_init_d)
+    con.register("tmp_init_d", df_init_d_snap)
+    con.execute("INSERT INTO daily_snapshot BY NAME SELECT * FROM tmp_init_d")
+    con.register("tmp_init_s", states_to_df(list(d_states.values())))
+    con.execute("INSERT INTO incremental_state BY NAME SELECT * FROM tmp_init_s")
+    con.close()
+
+    # 构造当日（2026-10-16）全部 16 根分钟线数据
+    time_slots = [
+        ("09:45", 10.0, 10.2, 9.9, 10.1),
+        ("10:00", 10.1, 10.3, 10.0, 10.2),
+        ("10:15", 10.2, 10.4, 10.1, 10.3),
+        ("10:30", 10.3, 10.5, 10.2, 10.4),  # Slot 4 (盘中 10:20 时未完结)
+        ("10:45", 10.4, 10.6, 10.3, 10.5),
+        ("11:00", 10.5, 10.7, 10.4, 10.6),
+        ("11:15", 10.6, 10.8, 10.5, 10.7),
+        ("11:30", 10.7, 10.9, 10.6, 10.8),
+        ("13:15", 10.8, 11.0, 10.7, 10.9),
+        ("13:30", 10.9, 11.1, 10.8, 11.0),
+        ("13:45", 11.0, 11.2, 10.9, 11.1),
+        ("14:00", 11.1, 11.3, 11.0, 11.2),
+        ("14:15", 11.2, 11.4, 11.1, 11.3),
+        ("14:30", 11.3, 11.5, 11.2, 11.4),
+        ("14:45", 11.4, 11.6, 11.3, 11.5),
+        ("15:00", 11.5, 11.7, 11.4, 11.6),
+    ]
+    all_16_bars = [
+        {"datetime": f"2026-10-16 {t}", "open": o, "high": h, "low": l, "close": c, "vol": 10000, "amount": 100000}
+        for t, o, h, l, c in time_slots
+    ]
+
+    # --- 阶段 1：模拟盘中 10:20:00 运行 allow_intraday=True ---
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 10, 20, 0))
+    monkeypatch.setattr("src.updater.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 10, 20, 0))
+
+    mock_fetcher = MagicMock()
+    # 盘中日线未收盘
+    mock_fetcher.get_latest_market_dates.return_value = (
+        datetime.date(2026, 10, 15), datetime.date(2026, 10, 16), False
+    )
+    mock_fetcher.get_latest_market_status.return_value = (datetime.date(2026, 10, 16), False)
+    mock_fetcher.fetch_xdxr_events.return_value = []
+    mock_fetcher.fetch_daily_bars.return_value = []
+    # 通达信返回了前 4 根线（包含正在跳动的 10:30 第 4 槽）
+    mock_fetcher.fetch_minute_bars.return_value = all_16_bars[:4]
+
+    updater = DailyUpdater(db_path=db_file, fetcher=mock_fetcher)
+    res_intra = updater.run_update(allow_intraday=True)
+
+    assert res_intra["status"] == "SUCCESS"
+    assert res_intra["minute_rows_added"] == 3  # Slot 4 被成功拦截！仅入库 Slot 1~3
+
+    con = duckdb.connect(db_file, read_only=True)
+    slots_intra = [r[0] for r in con.execute("SELECT slot_seq FROM minute_snapshot WHERE symbol = 'SZ000001' ORDER BY slot_seq").fetchall()]
+    d_count_intra = con.execute("SELECT COUNT(*) FROM daily_snapshot WHERE trade_date = '2026-10-16'").fetchone()[0]
+    con.close()
+    assert slots_intra == [1, 2, 3]
+    assert d_count_intra == 0  # 盘中绝不污染日线
+
+    # --- 阶段 2：模拟盘后 15:10:00 运行 allow_intraday=False ---
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 10, 0))
+    monkeypatch.setattr("src.updater.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 10, 0))
+
+    mock_fetcher.get_latest_market_dates.return_value = (
+        datetime.date(2026, 10, 16), datetime.date(2026, 10, 16), True
+    )
+    mock_fetcher.get_latest_market_status.return_value = (datetime.date(2026, 10, 16), True)
+    mock_fetcher.fetch_daily_bars.return_value = [
+        {"datetime": "2026-10-15", "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.2, "vol": 1000, "amount": 10200},
+        {"datetime": "2026-10-16", "open": 10.0, "high": 11.7, "low": 9.9, "close": 11.6, "vol": 160000, "amount": 1600000},
+    ]
+    mock_fetcher.fetch_minute_bars.return_value = all_16_bars
+
+    res_post = updater.run_update(allow_intraday=False)
+    assert res_post["status"] == "SUCCESS"
+    assert res_post["daily_rows_added"] == 1
+    assert res_post["minute_rows_added"] == 13  # 从 Slot 4 续接至 Slot 16 (共 13 根)
+
+    con = duckdb.connect(db_file, read_only=True)
+    all_slots = [r[0] for r in con.execute("SELECT slot_seq FROM minute_snapshot WHERE symbol = 'SZ000001' AND trading_date = '2026-10-16' ORDER BY slot_seq").fetchall()]
+    df_actual = con.execute("SELECT * FROM minute_snapshot WHERE symbol = 'SZ000001' AND trading_date = '2026-10-16' ORDER BY slot_seq").df()
+    con.close()
+    assert all_slots == list(range(1, 17))
+
+    # --- 阶段 3：在干净数据库上模拟一次性盘后全天运行，对比指标完全一致性 ---
+    db_clean = str(tmp_path / "test_clean_direct.duckdb")
+    con_c = duckdb.connect(db_clean)
+    create_tables(con_c)
+    con_c.execute("""
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, board, latest_adj_factor)
+        VALUES ('SZ000001', '000001', '平安银行', 'STOCK', 'SZSE', 'MAIN', 1.0)
+    """)
+    con_c.register("tmp_init_d", df_init_d_snap)
+    con_c.execute("INSERT INTO daily_snapshot BY NAME SELECT * FROM tmp_init_d")
+    con_c.register("tmp_init_s", states_to_df(list(d_states.values())))
+    con_c.execute("INSERT INTO incremental_state BY NAME SELECT * FROM tmp_init_s")
+    con_c.close()
+
+    updater_clean = DailyUpdater(db_path=db_clean, fetcher=mock_fetcher)
+    updater_clean.run_update(allow_intraday=False)
+
+    con_c = duckdb.connect(db_clean, read_only=True)
+    df_expected = con_c.execute("SELECT * FROM minute_snapshot WHERE symbol = 'SZ000001' AND trading_date = '2026-10-16' ORDER BY slot_seq").df()
+    con_c.close()
+
+    # 断言 16 个槽位的全部指标值与一次性全天更新 100% 吻合
+    metric_cols = [c for c in df_actual.columns if any(c.startswith(prefix) for prefix in ["sk_", "sd_", "skxl_", "sdxl_", "mk_", "md_", "mkxl_", "mdxl_"])]
+    for col in metric_cols:
+        diff = np.nanmax(np.abs(df_actual[col].values - df_expected[col].values))
+        assert diff < 1e-9, f"指标 {col} 存在差异: {diff}"
+
+
+def test_intraday_ex_dividend_no_double_multiply(tmp_path, monkeypatch):
+    """测试除权除息股票盘中更新与盘后补齐日线时，复权因子严格幂等、绝无二次累乘"""
+    db_file = str(tmp_path / "test_div_idempotent.duckdb")
+    con = duckdb.connect(db_file)
+    create_tables(con)
+    con.execute("""
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, board, latest_adj_factor)
+        VALUES ('SZ000001', '000001', '平安银行', 'STOCK', 'SZSE', 'MAIN', 1.0)
+    """)
+    # 截至 2026-10-15 收盘价 10.0，复权因子 1.0
+    con.execute("""
+        INSERT INTO daily_snapshot (
+            symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor
+        ) VALUES ('SZ000001', '000001', '2026-10-15', 10, 10.0, 10.5, 9.8, 10.0, 1000, 10000, 1.0)
+    """)
+    con.close()
+
+    # 2026-10-16 发生除权除息: 每10股派2元 (fenhong=2.0)
+    # 除权参考价 = 10.0 - 0.2 = 9.8
+    # 期望新因子 = 1.0 * (10.0 / 9.8) = 1.020408163...
+    expected_factor = 1.0 * (10.0 / 9.8)
+    event_div = [
+        {"year": 2026, "month": 10, "day": 16, "category": 1, "fenhong": 2.0, "songzhuangu": 0.0, "peigu": 0.0, "peigujia": 0.0}
+    ]
+
+    time_slots = [
+        ("09:45", 9.8, 9.9, 9.7, 9.8),
+        ("10:00", 9.8, 10.0, 9.8, 9.9),
+        ("10:15", 9.9, 10.1, 9.8, 10.0),
+        ("10:30", 10.0, 10.2, 9.9, 10.1),
+        ("10:45", 10.1, 10.3, 10.0, 10.2),
+        ("11:00", 10.2, 10.3, 10.1, 10.2),
+        ("11:15", 10.2, 10.4, 10.2, 10.3),
+        ("11:30", 10.3, 10.5, 10.2, 10.4),  # Slot 8
+        ("13:15", 10.4, 10.6, 10.3, 10.5),
+        ("13:30", 10.5, 10.7, 10.4, 10.6),
+        ("13:45", 10.6, 10.7, 10.5, 10.6),
+        ("14:00", 10.6, 10.8, 10.6, 10.7),
+        ("14:15", 10.7, 10.9, 10.6, 10.8),
+        ("14:30", 10.8, 10.9, 10.7, 10.8),
+        ("14:45", 10.8, 11.0, 10.8, 10.9),
+        ("15:00", 10.9, 11.0, 10.8, 11.0),
+    ]
+    all_16_bars = [
+        {"datetime": f"2026-10-16 {t}", "open": o, "high": h, "low": l, "close": c, "vol": 10000, "amount": 100000}
+        for t, o, h, l, c in time_slots
+    ]
+
+    # --- 阶段 1：模拟盘中 11:35:00 运行 allow_intraday=True ---
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 11, 35, 0))
+    monkeypatch.setattr("src.updater.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 11, 35, 0))
+
+    mock_fetcher = MagicMock()
+    mock_fetcher.get_latest_market_dates.return_value = (
+        datetime.date(2026, 10, 15), datetime.date(2026, 10, 16), False
+    )
+    mock_fetcher.get_latest_market_status.return_value = (datetime.date(2026, 10, 16), False)
+    mock_fetcher.fetch_xdxr_events.return_value = event_div
+    mock_fetcher.fetch_daily_bars.return_value = []
+    mock_fetcher.fetch_minute_bars.return_value = all_16_bars[:8]  # Slot 1~8
+
+    updater = DailyUpdater(db_path=db_file, fetcher=mock_fetcher)
+    res_intra = updater.run_update(allow_intraday=True)
+    assert res_intra["status"] == "SUCCESS"
+    assert res_intra["minute_rows_added"] == 8
+
+    con = duckdb.connect(db_file, read_only=True)
+    m_factors_intra = [r[0] for r in con.execute("SELECT adj_factor FROM minute_snapshot WHERE symbol = 'SZ000001'").fetchall()]
+    sec_adj_intra = con.execute("SELECT latest_adj_factor FROM security_info WHERE symbol = 'SZ000001'").fetchone()[0]
+    ca_cnt_intra = con.execute("SELECT COUNT(*) FROM corporate_action WHERE symbol = 'SZ000001'").fetchone()[0]
+    con.close()
+
+    assert len(m_factors_intra) == 8
+    for f in m_factors_intra:
+        assert abs(f - expected_factor) < 1e-6
+    assert abs(sec_adj_intra - expected_factor) < 1e-6
+    assert ca_cnt_intra == 1
+
+    # --- 阶段 2：模拟盘后 15:10:00 运行 allow_intraday=False ---
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 10, 0))
+    monkeypatch.setattr("src.updater.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 10, 0))
+
+    mock_fetcher.get_latest_market_dates.return_value = (
+        datetime.date(2026, 10, 16), datetime.date(2026, 10, 16), True
+    )
+    mock_fetcher.get_latest_market_status.return_value = (datetime.date(2026, 10, 16), True)
+    mock_fetcher.fetch_xdxr_events.return_value = event_div
+    mock_fetcher.fetch_daily_bars.return_value = [
+        {"datetime": "2026-10-15", "open": 10.0, "high": 10.5, "low": 9.8, "close": 10.0, "vol": 1000, "amount": 10000},
+        {"datetime": "2026-10-16", "open": 9.8, "high": 11.0, "low": 9.7, "close": 11.0, "vol": 160000, "amount": 1600000},
+    ]
+    mock_fetcher.fetch_minute_bars.return_value = all_16_bars
+
+    res_post = updater.run_update(allow_intraday=False)
+    assert res_post["status"] == "SUCCESS"
+    assert res_post["daily_rows_added"] == 1
+    assert res_post["minute_rows_added"] == 8  # Slot 9~16
+
+    con = duckdb.connect(db_file, read_only=True)
+    d_row = con.execute("SELECT adj_factor, close FROM daily_snapshot WHERE symbol = 'SZ000001' AND trade_date = '2026-10-16'").fetchone()
+    all_m_factors = [r[0] for r in con.execute("SELECT adj_factor FROM minute_snapshot WHERE symbol = 'SZ000001' ORDER BY slot_seq").fetchall()]
+    sec_adj_post = con.execute("SELECT latest_adj_factor FROM security_info WHERE symbol = 'SZ000001'").fetchone()[0]
+    ca_cnt_post = con.execute("SELECT COUNT(*) FROM corporate_action WHERE symbol = 'SZ000001'").fetchone()[0]
+    con.close()
+
+    # 关键断言：日线复权因子严格等于 expected_factor，绝未发生二次累乘 (如 1.0204 * 1.0204)
+    assert abs(d_row[0] - expected_factor) < 1e-6
+    # 全天 16 根分钟线复权因子严格等于 expected_factor
+    assert len(all_m_factors) == 16
+    for f in all_m_factors:
+        assert abs(f - expected_factor) < 1e-6
+    # 标的最新因子严格等于 expected_factor
+    assert abs(sec_adj_post - expected_factor) < 1e-6
+    # 除权事件表绝无重复记录
+    assert ca_cnt_post == 1
+
+

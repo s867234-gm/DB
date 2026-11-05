@@ -11,6 +11,7 @@ src/fetcher.py —— 通达信 (TDX) 高可用行情与除权数据采集器
 """
 
 import datetime
+from datetime import timezone, timedelta
 import logging
 import threading
 import time
@@ -20,6 +21,14 @@ import pandas as pd
 from pytdx.hq import TdxHq_API
 
 logger = logging.getLogger("fetcher")
+
+CN_TZ = timezone(timedelta(hours=8))
+
+
+def get_cn_now() -> datetime.datetime:
+    """获取当前北京时间（UTC+8 无时区对象，与通达信时间戳完全兼容）"""
+    return datetime.datetime.now(CN_TZ).replace(tzinfo=None)
+
 
 # 实测高可用券商自建主站列表（针对深圳电信宽带全面实测选优，跨多家券商与华南极速节点）
 BACKUP_SERVERS: List[Tuple[str, int, str]] = [
@@ -179,6 +188,7 @@ class TdxFetcher:
         - is_closed: 当天是否已完整走完 15:00。
         """
         # 上证指数日线与 15 分钟线（使用带重试与故障切换的安全拉取方法）
+        cn_now = get_cn_now()
         idx_daily = self.fetch_daily_bars("SH000001", "BROAD_INDEX", offset=5)
         idx_min15 = self.fetch_minute_bars("SH000001", "BROAD_INDEX", offset=16)
 
@@ -406,6 +416,10 @@ def parse_minute_bars_to_df(
     df = pd.DataFrame(records)
     # 严格按 trading_date, slot_seq 排序并去重（防止个别主站同时返回 11:30 与 13:00 导致 Slot 8 重复）
     df = df.sort_values(["trading_date", "slot_seq"]).drop_duplicates(subset=["trading_date", "slot_seq"], keep="last").reset_index(drop=True)
+
+    # 自动剔除盘中当前正在跳动、尚未收完的当根 15m K 线（预留 10 秒安全缓冲）
+    cutoff_time = get_cn_now() - timedelta(seconds=10)
+    df = df[df["bar_end"] <= cutoff_time].reset_index(drop=True)
     return df
 
 
