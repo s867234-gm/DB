@@ -309,7 +309,7 @@ class DailyUpdater:
         self,
         allow_intraday: bool = False,
         limit: Optional[int] = None,
-        batch_size: int = 100,
+        batch_size: int = 500,
     ) -> Dict:
         """执行日常增量更新主流程。"""
         start_time = time.time()

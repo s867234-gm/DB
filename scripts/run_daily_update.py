@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-scripts/run_daily_update.py —— 日常增量更新命令行一键运行入口
+scripts/run_daily_update.py —— 全市场日常/盘中增量更新执行入口
 
 用法:
-    python scripts/run_daily_update.py                      # 默认更新全市场最新收盘日
-    python scripts/run_daily_update.py --allow-intraday      # 盘中允许同步最新分钟线
-    python scripts/run_daily_update.py --limit 10            # 抽样更新 10 只标的
-    python scripts/run_daily_update.py --workers 16          # 指定 16 线程并发
+    python scripts/run_daily_update.py                      # 默认更新全市场（盘后）
+    python scripts/run_daily_update.py --allow-intraday      # 盘中同步最新分钟线
+    python scripts/run_daily_update.py --limit 10            # 仅更新 10 只标的
+    python scripts/run_daily_update.py --workers 24          # 指定 24 线程并发
+    python scripts/run_daily_update.py --batch-size 500      # 每批 500 只标的
 """
 
 import argparse
@@ -41,7 +42,7 @@ def setup_logger(log_dir: str = "logs"):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="A_DB A股全市场快照多周期增量更新")
+    parser = argparse.ArgumentParser(description="A_DB A股全市场增量更新调度脚本")
     parser.add_argument(
         "--db-path",
         type=str,
@@ -51,25 +52,25 @@ def main():
     parser.add_argument(
         "--allow-intraday",
         action="store_true",
-        help="允许更新盘中未走完 15:00 收盘的数据（默认仅更新已收盘交易日）",
+        help="允许更新未到 15:00 收盘的分钟线数据（默认仅推进完整收盘日）",
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="限制更新标的数量（用于快速抽样调试）",
+        help="限制更新标的数量（用于快速抽检）",
     )
     parser.add_argument(
         "--workers",
         type=int,
-        default=8,
-        help="并发拉取与计算线程数 (默认 8)",
+        default=24,
+        help="数据拉取并发线程数 (默认 24)",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=100,
-        help="数据库批量写入大小 (默认 100)",
+        default=500,
+        help="数据库分批写入大小 (默认 500)",
     )
 
     args = parser.parse_args()
@@ -80,6 +81,7 @@ def main():
     logger.info(f"  目标数据库: {args.db_path}")
     logger.info(f"  盘中模式: {args.allow_intraday}")
     logger.info(f"  并发线程: {args.workers}")
+    logger.info(f"  批次大小: {args.batch_size}")
     logger.info(f"  更新限制: {args.limit or '全市场'}")
     logger.info("==================================================")
 
