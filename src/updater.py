@@ -221,7 +221,8 @@ class DailyUpdater:
         new_corp_actions = []
         adj_by_date: Dict[datetime.date, float] = {}
 
-        if sec_type == "STOCK" and (not df_new_d.empty or not df_new_m.empty):
+        if sec_type == "STOCK" and not df_new_d.empty:
+            # 仅当有新日线需要推进归档时，拉取除权事件并推进因子
             events = self.fetcher.fetch_xdxr_events(sym)
             event_by_date = {}
             for e in events:
@@ -232,48 +233,37 @@ class DailyUpdater:
             # 确定前收盘价基准
             prev_c = task.get("last_close")
             if prev_c is None or prev_c <= 0:
-                if not df_new_d.empty:
-                    prev_c = df_new_d.iloc[0]["open"]
-                elif not df_new_m.empty:
-                    prev_c = df_new_m.iloc[0]["open"]
-                else:
-                    prev_c = 0.0
+                prev_c = df_new_d.iloc[0]["open"]
 
             # 1) 日线推进 adj_factor 并记录待持久化除权事件
-            if not df_new_d.empty:
-                adj_list = []
-                for _, r in df_new_d.iterrows():
-                    t_date = r["trade_date"]
-                    if t_date in event_by_date:
-                        ev = event_by_date[t_date]
-                        cur_adj = calculate_next_adj_factor(cur_adj, prev_c, ev)
-                        new_corp_actions.append({
-                            "symbol": sym,
-                            "event_date": t_date,
-                            "category": 1,
-                            "cash_dividend": float(ev.get("fenhong") or 0.0) / 10.0,
-                            "bonus_share": float(ev.get("songzhuangu") or 0.0) / 10.0,
-                            "rights_share": float(ev.get("peigu") or 0.0) / 10.0,
-                            "rights_price": float(ev.get("peigujia") or 0.0),
-                        })
-                    adj_by_date[t_date] = cur_adj
-                    adj_list.append(cur_adj)
-                    prev_c = r["close"]
-                df_new_d["adj_factor"] = adj_list
+            adj_list = []
+            for _, r in df_new_d.iterrows():
+                t_date = r["trade_date"]
+                if t_date in event_by_date:
+                    ev = event_by_date[t_date]
+                    cur_adj = calculate_next_adj_factor(cur_adj, prev_c, ev)
+                    new_corp_actions.append({
+                        "symbol": sym,
+                        "event_date": t_date,
+                        "category": 1,
+                        "cash_dividend": float(ev.get("fenhong") or 0.0) / 10.0,
+                        "bonus_share": float(ev.get("songzhuangu") or 0.0) / 10.0,
+                        "rights_share": float(ev.get("peigu") or 0.0) / 10.0,
+                        "rights_price": float(ev.get("peigujia") or 0.0),
+                    })
+                adj_by_date[t_date] = cur_adj
+                adj_list.append(cur_adj)
+                prev_c = r["close"]
+            df_new_d["adj_factor"] = adj_list
 
-            # 2) 检查分钟线中未被日线覆盖的交易日（例如盘中当日除权但日线暂未入库）
+            # 2) 分钟线按对应日期匹配
             if not df_new_m.empty:
-                m_dates = sorted(list(df_new_m["trading_date"].unique()))
-                m_cur_adj = cur_adj
-                for m_d in m_dates:
-                    if m_d not in adj_by_date:
-                        if m_d in event_by_date:
-                            ev = event_by_date[m_d]
-                            m_cur_adj = calculate_next_adj_factor(m_cur_adj, prev_c, ev)
-                        adj_by_date[m_d] = m_cur_adj
                 df_new_m["adj_factor"] = df_new_m["trading_date"].map(
                     lambda d: adj_by_date.get(d, cur_adj)
                 )
+        elif not df_new_m.empty and sec_type == "STOCK":
+            # 盘中纯分钟线更新模式：直接沿用当前最新复权因子，无需多余的网络除权请求
+            df_new_m["adj_factor"] = latest_adj
         else:
             if not df_new_d.empty:
                 df_new_d["adj_factor"] = 1.0

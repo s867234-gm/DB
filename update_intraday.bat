@@ -3,13 +3,13 @@ setlocal
 cd /d "%~dp0"
 
 echo ======================================================================
-echo   A_DB 数据库【盘中实时分钟线】增量更新脚本
+echo   A_DB 数据库【盘中实时分钟线】增量更新脚本 (16线程高并发极速版)
 echo   (仅同步当天已产生的 15 分钟线与动态 KDJ，日线自动隔离防污染)
 echo ======================================================================
 echo 正在执行盘中实时增量同步，请稍候...
 echo.
 
-python scripts\run_daily_update.py --allow-intraday %*
+python scripts\run_daily_update.py --allow-intraday --workers 16 --batch-size 200 %*
 
 if %ERRORLEVEL% equ 0 (
     echo.

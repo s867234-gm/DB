@@ -3,12 +3,12 @@ setlocal
 cd /d "%~dp0"
 
 echo ======================================================================
-echo   A_DB 数据库日常增量更新脚本 (通达信行情增量更新引擎)
+echo   A_DB 数据库日常增量更新脚本 (16线程高并发极速版)
 echo ======================================================================
 echo 正在执行数据库增量同步，请稍候...
 echo.
 
-python scripts\run_daily_update.py %*
+python scripts\run_daily_update.py --workers 16 --batch-size 200 %*
 
 if %ERRORLEVEL% equ 0 (
     echo.
