@@ -67,9 +67,10 @@ D:\DB\
 │   ├── builder.py          # 阶段 3 全市场历史数据全量构建引擎
 │   └── updater.py          # 阶段 4 幂等增量更新调度器
 ├── scripts/
+│   ├── manage_tasks.py     # Windows 计划任务自动化注册与生命周期管理工具
 │   ├── pilot_verify.py     # 阶段 2 核心样本指标与规则 A 核验脚本
 │   ├── run_phase3_full_build.py # 全量构建入口
-│   ├── run_daily_update.py # 日常增量更新命令行运行入口
+│   ├── run_daily_update.py # 日常增量更新命令行运行入口 (带进程互斥文件锁)
 │   ├── verify_phase4.py    # 阶段 4 增量同步与全库体检核验脚本
 │   └── verify_full_db.py   # 全库数据质量核验与健康体检脚本
 ├── tests/
@@ -81,8 +82,11 @@ D:\DB\
 │   ├── phase2_pilot_report.md       # 阶段 2 小样本核验报告
 │   ├── phase3_full_build_report.md  # 阶段 3 全市场全量构建报告
 │   └── phase4_update_report.md      # 阶段 4 增量更新与实战验收报告
-├── update_db.bat           # Windows 批处理一键更新脚本 (盘后默认 15:10 以后执行)
-├── update_intraday.bat     # Windows 批处理盘中实时分钟线更新脚本
+├── enable_auto_update.bat  # Windows 批处理一键启用定时自动更新 (盘中 16 次 + 盘后 15:32)
+├── disable_auto_update.bat # Windows 批处理一键停用并卸载定时任务
+├── update_db.bat           # Windows 批处理手动更新脚本 (盘后 15:32 完整执行)
+├── update_intraday.bat     # Windows 批处理盘中手动实时分钟线更新脚本
+├── pack_code.bat           # Windows 批处理全量代码库打包工具 (Repomix)
 ├── .gitignore              # 忽略 DuckDB 二进制与日志缓存
 └── README.md               # 本项目完整技术文档
 ```
@@ -215,21 +219,28 @@ D:\DB\
 
 ## 五、日常使用与快速上手
 
-### 1. 命令行增量更新
+### 1. Windows 全自动定时任务（推荐，开箱即用、无需人工值守）
+本系统已内置标准的 Windows 计划任务自动化调度配置（周一至周五全自动执行，支持笔记本电池运行、任务就绪唤醒与进程互斥防重叠）：
+- **一键启用自动定时更新**：双击根目录下的 `enable_auto_update.bat`，自动注册以下两个计划任务：
+  1. `A_DB_Intraday_15m_Update`：周一至周五盘中每个 15m K 线完结后第 1 分钟自动触发增量计算（共 16 次：上午 `09:46 ~ 11:31`，下午 `13:16 ~ 15:01`），自动拦截跳动中未完结 K 线，日线绝不被盘中污染。
+  2. `A_DB_PostMarket_Daily_Update`：周一至周五盘后 **`15:32`** 自动触发完整更新（精准对齐 A 股 `15:05~15:30` 盘后固定价格交易，确保日线成交量成交额完整收口，同时归档全天 16 根分钟线）。
+- **一键停用自动定时更新**：双击根目录下的 `disable_auto_update.bat` 即可一键安全移除计划任务。
+
+### 2. 手动命令行增量更新
 ```bash
-# 1. 默认更新：同步至最新已完整收盘的交易日（推荐收盘后 15:10 以后执行）
+# 1. 默认盘后完整更新：同步至最新已完整收盘交易日（对齐 15:30 盘后固定价格收盘，推荐 15:32 以后执行）
 python scripts/run_daily_update.py
 
-# 2. 盘中更新：允许同步当天盘中已走过的 15 分钟线
+# 2. 盘中更新：同步当天盘中已完结的 15 分钟线
 python scripts/run_daily_update.py --allow-intraday
 
-# 3. 指定高并发线程与批次
-python scripts/run_daily_update.py --workers 16 --batch-size 200
+# 3. 指定并发线程与批次大小 (默认 24 线程, 500 标的一批)
+python scripts/run_daily_update.py --workers 24 --batch-size 500
 ```
 
-### 2. Windows 桌面双击一键更新
-- **盘后完整收盘更新（推荐 15:10 后）**：双击根目录下的 `update_db.bat`，自动同步最新已收盘日线与全天 16 根分钟线。
-- **盘中实时更新分钟线（交易时段 09:30~15:00）**：双击根目录下的 `update_intraday.bat`，仅同步当天已产生的分钟线并计算盘中动态 KDJ，日线自动隔离防污染。
+### 3. Windows 桌面双击手动更新
+- **盘后完整收盘更新（推荐 15:32 后）**：双击根目录下的 `update_db.bat`，自动同步最新已收盘日线与全天 16 根分钟线。
+- **盘中实时更新分钟线（交易时段 09:30~15:00）**：双击根目录下的 `update_intraday.bat`，仅同步当天已完结的分钟线并计算盘中动态 KDJ，日线自动隔离防污染。
 
 ---
 

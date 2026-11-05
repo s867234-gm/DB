@@ -71,6 +71,20 @@ class DailyUpdater:
         self.fetcher = fetcher or TdxFetcher()
         self.max_workers = max_workers
 
+    def _connect_rw(self, retries: int = 5, delay: float = 2.0) -> duckdb.DuckDBPyConnection:
+        """获取 DuckDB 读写连接，遇到文件锁冲突自动重试（最多 retries 次，每次间隔 delay 秒）"""
+        for i in range(retries):
+            try:
+                return duckdb.connect(self.db_path)
+            except Exception as e:
+                err_msg = str(e).lower()
+                if ("lock" in err_msg or "conflict" in err_msg or "resource" in err_msg) and i < retries - 1:
+                    logger.warning(f"DuckDB 读写连接锁冲突，等待 {delay}s 后重试 ({i + 1}/{retries})... 详情: {e}")
+                    time.sleep(delay)
+                else:
+                    raise
+        return duckdb.connect(self.db_path)
+
     def get_update_plan(
         self,
         target_date: datetime.date,
@@ -469,7 +483,7 @@ class DailyUpdater:
                 b_df_ca = pd.DataFrame(ca_list).drop_duplicates(subset=["symbol", "event_date", "category"], keep="last") if ca_list else pd.DataFrame()
 
                 # 写入 DuckDB (原子事务 + BY NAME)
-                con = duckdb.connect(self.db_path)
+                con = self._connect_rw()
                 try:
                     con.execute("PRAGMA threads=8;")
                     con.execute("BEGIN TRANSACTION;")
@@ -537,7 +551,7 @@ class DailyUpdater:
                     con.close()
 
         # 全部批次完成后触发 CHECKPOINT 保证 WAL 日志落盘
-        con_chk = duckdb.connect(self.db_path)
+        con_chk = self._connect_rw()
         try:
             con_chk.execute("CHECKPOINT;")
         finally:

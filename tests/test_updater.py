@@ -488,9 +488,9 @@ def test_intraday_unclosed_bar_filtered_and_post_market_resumes(tmp_path, monkey
     assert slots_intra == [1, 2, 3]
     assert d_count_intra == 0  # 盘中绝不污染日线
 
-    # --- 阶段 2：模拟盘后 15:10:00 运行 allow_intraday=False ---
-    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 10, 0))
-    monkeypatch.setattr("src.updater.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 10, 0))
+    # --- 阶段 2：模拟盘后 15:35:00 运行 allow_intraday=False ---
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 35, 0))
+    monkeypatch.setattr("src.updater.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 35, 0))
 
     mock_fetcher.get_latest_market_dates.return_value = (
         datetime.date(2026, 10, 16), datetime.date(2026, 10, 16), True
@@ -619,9 +619,9 @@ def test_intraday_ex_dividend_no_double_multiply(tmp_path, monkeypatch):
     assert abs(sec_adj_intra - expected_factor) < 1e-6
     assert ca_cnt_intra == 1
 
-    # --- 阶段 2：模拟盘后 15:10:00 运行 allow_intraday=False ---
-    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 10, 0))
-    monkeypatch.setattr("src.updater.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 10, 0))
+    # --- 阶段 2：模拟盘后 15:35:00 运行 allow_intraday=False ---
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 35, 0))
+    monkeypatch.setattr("src.updater.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 35, 0))
 
     mock_fetcher.get_latest_market_dates.return_value = (
         datetime.date(2026, 10, 16), datetime.date(2026, 10, 16), True
@@ -688,13 +688,54 @@ def test_get_latest_market_dates_at_1450_not_closed(monkeypatch):
     assert d_date_true == datetime.date(2026, 10, 15)  # 严格回退为上一交易日
     assert m_date_true == datetime.date(2026, 10, 16)  # 盘中允许查看今日分钟线
 
-    # 2. 模拟北京时间当日 15:00:15 (已走完 15:00:10 缓冲，正式收盘)
-    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 0, 15))
+    # 2. 模拟北京时间当日 15:35:00 (已走完 15:30:10 盘后固定价格交易缓冲，正式收盘)
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 35, 0))
 
     d_date_post, m_date_post, closed_post = fetcher.get_latest_market_dates(allow_intraday=False)
     assert closed_post is True
     assert d_date_post == datetime.date(2026, 10, 16)
     assert m_date_post == datetime.date(2026, 10, 16)
+
+
+def test_get_latest_market_dates_before_and_after_1530(monkeypatch):
+    """测试 15:30:10 盘后固定价格交易收盘阈值前后 is_closed 状态判定"""
+    fetcher = TdxFetcher()
+
+    mock_daily = [
+        {"datetime": "2026-10-15", "open": 3200.0, "high": 3220.0, "low": 3190.0, "close": 3210.0},
+        {"datetime": "2026-10-16", "open": 3210.0, "high": 3230.0, "low": 3205.0, "close": 3225.0},
+    ]
+    mock_min16 = [
+        {"datetime": "2026-10-16 15:00", "open": 3220.0, "high": 3226.0, "low": 3218.0, "close": 3225.0}
+    ]
+
+    monkeypatch.setattr(fetcher, "fetch_daily_bars", lambda symbol, sec_type, offset=5: mock_daily)
+    monkeypatch.setattr(fetcher, "fetch_minute_bars", lambda symbol, sec_type, offset=16: mock_min16)
+
+    # 1. 14:50:00 (尾盘连续竞价时段) -> is_closed == False, daily_target_date == prev_day
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 14, 50, 0))
+    d_d, m_d, closed = fetcher.get_latest_market_dates(allow_intraday=False)
+    assert closed is False
+    assert d_d == datetime.date(2026, 10, 15)
+
+    # 2. 15:15:00 (盘后固定价格交易时段，日线未定格) -> is_closed == False, daily_target_date == prev_day
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 15, 0))
+    d_d, m_d, closed = fetcher.get_latest_market_dates(allow_intraday=False)
+    assert closed is False
+    assert d_d == datetime.date(2026, 10, 15)
+    # 盘中模式下分钟线可以看今日
+    d_d_in, m_d_in, closed_in = fetcher.get_latest_market_dates(allow_intraday=True)
+    assert closed_in is False
+    assert d_d_in == datetime.date(2026, 10, 15)
+    assert m_d_in == datetime.date(2026, 10, 16)
+
+    # 3. 15:31:00 (盘后固定价格交易已完全结束并走完缓冲) -> is_closed == True, daily_target_date == latest_day
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 31, 0))
+    d_d, m_d, closed = fetcher.get_latest_market_dates(allow_intraday=False)
+    assert closed is True
+    assert d_d == datetime.date(2026, 10, 16)
+    assert m_d == datetime.date(2026, 10, 16)
+
 
 
 

@@ -17,12 +17,60 @@ import os
 import sys
 import time
 
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
 # 确保项目根目录在 sys.path 中
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.updater import DailyUpdater
+
+
+class SingleInstanceLock:
+    """跨进程单实例互斥文件锁（基于 Windows msvcrt.locking）"""
+
+    def __init__(self, lock_file_path: str):
+        self.lock_file_path = lock_file_path
+        self.handle = None
+
+    def acquire(self) -> bool:
+        if msvcrt is None:
+            return True
+        os.makedirs(os.path.dirname(self.lock_file_path), exist_ok=True)
+        try:
+            self.handle = open(self.lock_file_path, "a+")
+            self.handle.seek(0)
+            msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+            self.handle.truncate(0)
+            self.handle.write(f"{os.getpid()}\n")
+            self.handle.flush()
+            return True
+        except (IOError, OSError):
+            if self.handle:
+                try:
+                    self.handle.close()
+                except Exception:
+                    pass
+                self.handle = None
+            return False
+
+    def release(self):
+        if self.handle:
+            try:
+                self.handle.seek(0)
+                if msvcrt:
+                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
+                pass
+            try:
+                self.handle.close()
+            except Exception:
+                pass
+            self.handle = None
 
 
 def setup_logger(log_dir: str = "logs"):
@@ -76,34 +124,49 @@ def main():
     args = parser.parse_args()
     logger = setup_logger()
 
-    logger.info("==================================================")
-    logger.info("  A_DB 数据库日常增量更新流程启动")
-    logger.info(f"  目标数据库: {args.db_path}")
-    logger.info(f"  盘中模式: {args.allow_intraday}")
-    logger.info(f"  并发线程: {args.workers}")
-    logger.info(f"  批次大小: {args.batch_size}")
-    logger.info(f"  更新限制: {args.limit or '全市场'}")
-    logger.info("==================================================")
+    lock_file = os.path.join(project_root, "logs", "update.lock")
+    lock = SingleInstanceLock(lock_file)
+    if not lock.acquire():
+        existing_pid = "未知"
+        try:
+            with open(lock_file, "r") as rf:
+                existing_pid = rf.read().strip()
+        except Exception:
+            pass
+        logger.warning(f"检测到已有更新进程正在运行 (PID: {existing_pid})，本实例安全退出")
+        sys.exit(0)
 
-    updater = DailyUpdater(
-        db_path=args.db_path,
-        max_workers=args.workers,
-    )
+    try:
+        logger.info("==================================================")
+        logger.info("  A_DB 数据库日常增量更新流程启动")
+        logger.info(f"  目标数据库: {args.db_path}")
+        logger.info(f"  盘中模式: {args.allow_intraday}")
+        logger.info(f"  并发线程: {args.workers}")
+        logger.info(f"  批次大小: {args.batch_size}")
+        logger.info(f"  更新限制: {args.limit or '全市场'}")
+        logger.info("==================================================")
 
-    result = updater.run_update(
-        allow_intraday=args.allow_intraday,
-        limit=args.limit,
-        batch_size=args.batch_size,
-    )
+        updater = DailyUpdater(
+            db_path=args.db_path,
+            max_workers=args.workers,
+        )
 
-    logger.info("==================================================")
-    logger.info(f"  执行状态: {result['status']}")
-    logger.info(f"  目标日期: {result.get('target_date')}")
-    logger.info(f"  更新标的: {result.get('symbols_updated', 0)} 只")
-    logger.info(f"  日线追加: {result.get('daily_rows_added', 0):,} 行")
-    logger.info(f"  分钟追加: {result.get('minute_rows_added', 0):,} 行")
-    logger.info(f"  总计耗时: {result.get('elapsed_seconds', 0)} 秒")
-    logger.info("==================================================")
+        result = updater.run_update(
+            allow_intraday=args.allow_intraday,
+            limit=args.limit,
+            batch_size=args.batch_size,
+        )
+
+        logger.info("==================================================")
+        logger.info(f"  执行状态: {result['status']}")
+        logger.info(f"  目标日期: {result.get('target_date')}")
+        logger.info(f"  更新标的: {result.get('symbols_updated', 0)} 只")
+        logger.info(f"  日线追加: {result.get('daily_rows_added', 0):,} 行")
+        logger.info(f"  分钟追加: {result.get('minute_rows_added', 0):,} 行")
+        logger.info(f"  总计耗时: {result.get('elapsed_seconds', 0)} 秒")
+        logger.info("==================================================")
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

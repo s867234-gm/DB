@@ -198,9 +198,9 @@ class TdxFetcher:
         latest_day_str = idx_daily[-1]["datetime"][:10]
         latest_day = datetime.datetime.strptime(latest_day_str, "%Y-%m-%d").date()
 
-        # 检查最新交易日是否已完整收盘（15分钟线最后一条达到 15:00 且当前北京时间已走完 15:00:10 预留缓冲）
+        # 检查最新交易日是否已完整收盘（15分钟线最后一条达到 15:00 且当前北京时间已走完 15:30:10 盘后固定价格交易收盘缓冲）
         is_closed = False
-        market_close_cutoff = datetime.datetime.combine(latest_day, datetime.time(15, 0, 10))
+        market_close_cutoff = datetime.datetime.combine(latest_day, datetime.time(15, 30, 10))
         if idx_min15:
             last_min = idx_min15[-1]
             last_min_dt = last_min["datetime"]
