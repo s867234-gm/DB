@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from src.fetcher import (
+    TdxFetcher,
     calculate_next_adj_factor,
     parse_daily_bars_to_df,
     parse_minute_bars_to_df,
@@ -655,5 +656,45 @@ def test_intraday_ex_dividend_no_double_multiply(tmp_path, monkeypatch):
     assert abs(sec_adj_post - expected_factor) < 1e-6
     # 除权事件表绝无重复记录
     assert ca_cnt_post == 1
+
+
+def test_get_latest_market_dates_at_1450_not_closed(monkeypatch):
+    """测试 14:45~15:00 尾盘时段即使 15m K 线带有 15:00 时间戳，也绝不误判 is_closed 为 True"""
+    fetcher = TdxFetcher()
+
+    # 模拟上证指数行情：最新日线为 2026-10-16，前一交易日为 2026-10-15
+    mock_daily = [
+        {"datetime": "2026-10-15", "open": 3200.0, "high": 3220.0, "low": 3190.0, "close": 3210.0},
+        {"datetime": "2026-10-16", "open": 3210.0, "high": 3230.0, "low": 3205.0, "close": 3225.0},
+    ]
+    # 模拟通达信在 14:50 返回的第 16 根 K 线（已打上 15:00 时间戳）
+    mock_min16 = [
+        {"datetime": "2026-10-16 15:00", "open": 3220.0, "high": 3226.0, "low": 3218.0, "close": 3225.0}
+    ]
+
+    monkeypatch.setattr(fetcher, "fetch_daily_bars", lambda symbol, sec_type, offset=5: mock_daily)
+    monkeypatch.setattr(fetcher, "fetch_minute_bars", lambda symbol, sec_type, offset=16: mock_min16)
+
+    # 1. 模拟北京时间当日 14:50:00 (尚未收盘)
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 14, 50, 0))
+
+    d_date_false, m_date_false, closed_false = fetcher.get_latest_market_dates(allow_intraday=False)
+    assert closed_false is False
+    assert d_date_false == datetime.date(2026, 10, 15)  # 严格回退为上一交易日
+    assert m_date_false == datetime.date(2026, 10, 15)
+
+    d_date_true, m_date_true, closed_true = fetcher.get_latest_market_dates(allow_intraday=True)
+    assert closed_true is False
+    assert d_date_true == datetime.date(2026, 10, 15)  # 严格回退为上一交易日
+    assert m_date_true == datetime.date(2026, 10, 16)  # 盘中允许查看今日分钟线
+
+    # 2. 模拟北京时间当日 15:00:15 (已走完 15:00:10 缓冲，正式收盘)
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 0, 15))
+
+    d_date_post, m_date_post, closed_post = fetcher.get_latest_market_dates(allow_intraday=False)
+    assert closed_post is True
+    assert d_date_post == datetime.date(2026, 10, 16)
+    assert m_date_post == datetime.date(2026, 10, 16)
+
 
 
