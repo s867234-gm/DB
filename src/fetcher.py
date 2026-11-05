@@ -373,10 +373,10 @@ def parse_minute_bars_to_df(
 
         slot = TIME_TO_SLOT.get(t_str)
         if slot is None:
-            # 容错：个别情况 13:00 归为 13:15
+            # 容错：通达信部分行情站将上午收盘 11:30:00 的 15 分钟线标记为 13:00:00，归入 Slot 8
             if t_str == "13:00:00":
-                t_str = "13:15:00"
-                slot = 9
+                t_str = "11:30:00"
+                slot = 8
             else:
                 continue
 
