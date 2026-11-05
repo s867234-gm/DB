@@ -96,15 +96,14 @@ class DailyUpdater:
                 GROUP BY symbol
             """).df()
 
-            # 3. 当前 15 分钟线最新进展 (增加当天已入库槽位数统计，确保盘后归档绝不遗漏槽位)
+            # 3. 当前 15 分钟线最新进展
             m_df = con.execute("""
                 SELECT symbol, 
                        MAX(trading_date) AS last_m_date, 
-                       ARG_MAX(slot_seq, bar_end) AS last_m_slot,
-                       COUNT(CASE WHEN trading_date = ? THEN 1 END) AS target_day_slot_cnt
+                       ARG_MAX(slot_seq, bar_end) AS last_m_slot
                 FROM minute_snapshot
                 GROUP BY symbol
-            """, [target_date]).df()
+            """).df()
         finally:
             con.close()
 
@@ -138,14 +137,8 @@ class DailyUpdater:
             if last_m is not None:
                 if last_m > target_date:
                     needs_minute = False
-                elif last_m == target_date:
-                    target_slot_cnt = int(row.get("target_day_slot_cnt", 0)) if pd.notnull(row.get("target_day_slot_cnt")) else 0
-                    if not allow_intraday and last_slot >= 16 and target_slot_cnt < 16:
-                        # 仅当已走到 slot 16 但当天总槽位数仍少于 16（中途有漏槽）时，重置从 slot 0 起整天补齐
-                        needs_minute = True
-                        last_slot = 0
-                    elif last_slot >= 16:
-                        needs_minute = False
+                elif last_m == target_date and last_slot >= 16:
+                    needs_minute = False
 
             # 若标的已退市且数据已更新至退市日或之后，则不再产生更新任务
             delist_d = to_date(row.get("delist_date"))

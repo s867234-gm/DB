@@ -178,10 +178,9 @@ class TdxFetcher:
         - minute_target_date: 若 is_closed 或 allow_intraday 则为 latest_day，否则为 prev_day。
         - is_closed: 当天是否已完整走完 15:00。
         """
-        api = self.pool.get_client()
-        # 上证指数日线与 15 分钟线
-        idx_daily = api.get_index_bars(4, 1, "000001", 0, 5)
-        idx_min15 = api.get_index_bars(1, 1, "000001", 0, 16)
+        # 上证指数日线与 15 分钟线（使用带重试与故障切换的安全拉取方法）
+        idx_daily = self.fetch_daily_bars("SH000001", "BROAD_INDEX", offset=5)
+        idx_min15 = self.fetch_minute_bars("SH000001", "BROAD_INDEX", offset=16)
 
         if not idx_daily:
             raise RuntimeError("无法获取上证指数行情以确认市场状态")
@@ -340,7 +339,7 @@ def parse_daily_bars_to_df(
         return pd.DataFrame()
 
     df = pd.DataFrame(records)
-    df = df.sort_values("trade_date").reset_index(drop=True)
+    df = df.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
     return df
 
 
@@ -405,8 +404,8 @@ def parse_minute_bars_to_df(
         return pd.DataFrame()
 
     df = pd.DataFrame(records)
-    # 严格按 trading_date, slot_seq 排序
-    df = df.sort_values(["trading_date", "slot_seq"]).reset_index(drop=True)
+    # 严格按 trading_date, slot_seq 排序并去重（防止个别主站同时返回 11:30 与 13:00 导致 Slot 8 重复）
+    df = df.sort_values(["trading_date", "slot_seq"]).drop_duplicates(subset=["trading_date", "slot_seq"], keep="last").reset_index(drop=True)
     return df
 
 
