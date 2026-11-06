@@ -589,9 +589,9 @@ def test_intraday_ex_dividend_no_double_multiply(tmp_path, monkeypatch):
         for t, o, h, l, c in time_slots
     ]
 
-    # --- 阶段 1：模拟盘中 11:35:00 运行 allow_intraday=True ---
-    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 11, 35, 0))
-    monkeypatch.setattr("src.updater.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 11, 35, 0))
+    # --- 阶段 1a：模拟盘中 10:05:00 首次更新 allow_intraday=True (入库 Slot 1~2) ---
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 10, 5, 0))
+    monkeypatch.setattr("src.updater.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 10, 5, 0))
 
     mock_fetcher = MagicMock()
     mock_fetcher.get_latest_market_dates.return_value = (
@@ -600,24 +600,49 @@ def test_intraday_ex_dividend_no_double_multiply(tmp_path, monkeypatch):
     mock_fetcher.get_latest_market_status.return_value = (datetime.date(2026, 10, 16), False)
     mock_fetcher.fetch_xdxr_events.return_value = event_div
     mock_fetcher.fetch_daily_bars.return_value = []
-    mock_fetcher.fetch_minute_bars.return_value = all_16_bars[:8]  # Slot 1~8
+    mock_fetcher.fetch_minute_bars.return_value = all_16_bars[:2]  # Slot 1~2
 
     updater = DailyUpdater(db_path=db_file, fetcher=mock_fetcher)
-    res_intra = updater.run_update(allow_intraday=True)
-    assert res_intra["status"] == "SUCCESS"
-    assert res_intra["minute_rows_added"] == 8
+    res_intra1a = updater.run_update(allow_intraday=True)
+    assert res_intra1a["status"] == "SUCCESS"
+    assert res_intra1a["minute_rows_added"] == 2
+    # 首次触发除权预演，fetch_xdxr_events 被调用 1 次
+    assert mock_fetcher.fetch_xdxr_events.call_count == 1
 
     con = duckdb.connect(db_file, read_only=True)
-    m_factors_intra = [r[0] for r in con.execute("SELECT adj_factor FROM minute_snapshot WHERE symbol = 'SZ000001'").fetchall()]
-    sec_adj_intra = con.execute("SELECT latest_adj_factor FROM security_info WHERE symbol = 'SZ000001'").fetchone()[0]
-    ca_cnt_intra = con.execute("SELECT COUNT(*) FROM corporate_action WHERE symbol = 'SZ000001'").fetchone()[0]
+    m_factors_1a = [r[0] for r in con.execute("SELECT adj_factor FROM minute_snapshot WHERE symbol = 'SZ000001'").fetchall()]
+    sec_adj_1a = con.execute("SELECT latest_adj_factor FROM security_info WHERE symbol = 'SZ000001'").fetchone()[0]
+    ca_cnt_1a = con.execute("SELECT COUNT(*) FROM corporate_action WHERE symbol = 'SZ000001'").fetchone()[0]
     con.close()
 
-    assert len(m_factors_intra) == 8
-    for f in m_factors_intra:
+    assert len(m_factors_1a) == 2
+    for f in m_factors_1a:
         assert abs(f - expected_factor) < 1e-6
-    assert abs(sec_adj_intra - expected_factor) < 1e-6
-    assert ca_cnt_intra == 1
+    assert abs(sec_adj_1a - expected_factor) < 1e-6
+    assert ca_cnt_1a == 1
+
+    # --- 阶段 1b：模拟盘中 11:35:00 继续更新 allow_intraday=True (入库 Slot 3~8) ---
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 11, 35, 0))
+    monkeypatch.setattr("src.updater.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 11, 35, 0))
+    mock_fetcher.fetch_minute_bars.return_value = all_16_bars[:8]  # Slot 1~8
+
+    res_intra1b = updater.run_update(allow_intraday=True)
+    assert res_intra1b["status"] == "SUCCESS"
+    assert res_intra1b["minute_rows_added"] == 6  # 续接入库 Slot 3~8 (共 6 根)
+    # 关键断言：同日 Slot 2~16 增量推进免拉取除权接口，fetch_xdxr_events 未被再次调用！
+    assert mock_fetcher.fetch_xdxr_events.call_count == 1
+
+    con = duckdb.connect(db_file, read_only=True)
+    m_factors_1b = [r[0] for r in con.execute("SELECT adj_factor FROM minute_snapshot WHERE symbol = 'SZ000001' ORDER BY slot_seq").fetchall()]
+    sec_adj_1b = con.execute("SELECT latest_adj_factor FROM security_info WHERE symbol = 'SZ000001'").fetchone()[0]
+    ca_cnt_1b = con.execute("SELECT COUNT(*) FROM corporate_action WHERE symbol = 'SZ000001'").fetchone()[0]
+    con.close()
+
+    assert len(m_factors_1b) == 8
+    for f in m_factors_1b:
+        assert abs(f - expected_factor) < 1e-6
+    assert abs(sec_adj_1b - expected_factor) < 1e-6
+    assert ca_cnt_1b == 1
 
     # --- 阶段 2：模拟盘后 15:35:00 运行 allow_intraday=False ---
     monkeypatch.setattr("src.fetcher.get_cn_now", lambda: datetime.datetime(2026, 10, 16, 15, 35, 0))

@@ -112,11 +112,12 @@ class DailyUpdater:
                 GROUP BY symbol
             """).df()
 
-            # 3. 当前 15 分钟线最新进展
+            # 3. 当前 15 分钟线最新进展 (增加 ARG_MAX(adj_factor, bar_end) 获取最新已入库分钟线复权因子)
             m_df = con.execute("""
                 SELECT symbol, 
                        MAX(trading_date) AS last_m_date, 
-                       ARG_MAX(slot_seq, bar_end) AS last_m_slot
+                       ARG_MAX(slot_seq, bar_end) AS last_m_slot,
+                       ARG_MAX(adj_factor, bar_end) AS last_m_adj
                 FROM minute_snapshot
                 GROUP BY symbol
             """).df()
@@ -141,6 +142,7 @@ class DailyUpdater:
             last_close = float(row["last_close"]) if pd.notnull(row["last_close"]) else None
             last_m = to_date(row["last_m_date"])
             last_slot = int(row["last_m_slot"]) if pd.notnull(row["last_m_slot"]) else 0
+            last_m_adj = float(row["last_m_adj"]) if (pd.notnull(row.get("last_m_adj")) and not pd.isna(row.get("last_m_adj"))) else None
             latest_adj = float(row["latest_adj_factor"]) if pd.notnull(row["latest_adj_factor"]) else 1.0
             last_daily_adj = float(row["last_daily_adj"]) if pd.notnull(row["last_daily_adj"]) else None
 
@@ -175,6 +177,7 @@ class DailyUpdater:
                     "last_close": last_close,
                     "last_m_date": last_m,
                     "last_m_slot": last_slot,
+                    "last_m_adj": last_m_adj,
                     "needs_daily": needs_daily,
                     "needs_minute": needs_minute,
                     "daily_target_date": daily_target_date,
@@ -196,6 +199,7 @@ class DailyUpdater:
         last_bar_seq = task["last_bar_seq"]
         last_m = to_date(task["last_m_date"])
         last_m_slot = task["last_m_slot"]
+        last_m_adj = task.get("last_m_adj")
         latest_adj = task["latest_adj_factor"]
         last_daily_adj = task.get("last_daily_adj")
         target_date = to_date(task.get("target_date") or target_date)
@@ -217,8 +221,11 @@ class DailyUpdater:
         days_gap_d = (daily_target_date - last_d).days if (last_d and daily_target_date) else 30
         daily_offset = min(max(days_gap_d + 10, 15), 800)
 
-        days_gap_m = (target_date - last_m).days if (last_m and target_date) else 10
-        minute_offset = min(max((days_gap_m + 3) * 16, 48), 800)
+        if last_m is not None and last_m == target_date:
+            minute_offset = min(max((16 - last_m_slot) + 4, 8), 48)
+        else:
+            days_gap_m = (target_date - last_m).days if (last_m and target_date) else 10
+            minute_offset = min(max((days_gap_m + 3) * 16, 48), 800)
 
         # 2. 拉取日线增量数据（仅当 needs_daily 且过滤 <= daily_target_date，绝不入库未收盘日线）
         df_new_d = pd.DataFrame()
@@ -253,11 +260,13 @@ class DailyUpdater:
             # 判断是否需要拉取除权事件：
             # 1) 日线有新数据推进
             # 2) 盘中模式 (allow_intraday=True) 且 分钟目标日大于日线目标日 (target_date > daily_target_date) 且有分钟线
+            #    且仅限当日首次入库分钟线 (last_m is None or last_m < target_date)
             has_intraday_preview = (
                 allow_intraday
                 and daily_target_date is not None
                 and target_date > daily_target_date
                 and not df_new_m.empty
+                and (last_m is None or last_m < target_date)
             )
 
             if not df_new_d.empty or has_intraday_preview:
@@ -297,7 +306,7 @@ class DailyUpdater:
                         prev_c = r["close"]
                     df_new_d["adj_factor"] = adj_list
 
-                # 2) 盘中模式下的当日除权因子预演：
+                # 2) 盘中模式下的当日除权因子预演 (情况 A: 当日首次入库分钟线)：
                 # 检查在 (daily_target_date, target_date] 期间是否存在 category == 1 的除权除息记录
                 if has_intraday_preview:
                     for ev_date, ev in sorted(event_by_date.items()):
@@ -323,8 +332,13 @@ class DailyUpdater:
                         lambda d: adj_by_date.get(d, curr_adj)
                     )
             elif not df_new_m.empty:
-                # 盘中纯分钟线更新模式且无除权预演需求：直接沿用 curr_adj
-                df_new_m["adj_factor"] = curr_adj
+                # 情况 B: 同日盘中 Slot 2~16 增量推进，免重复拉取除权接口，直接复用当日已入库分钟线的复权因子
+                if last_m is not None and last_m == target_date:
+                    intra_adj = float(last_m_adj) if (last_m_adj is not None and not pd.isna(last_m_adj)) else float(latest_adj)
+                else:
+                    intra_adj = curr_adj
+                df_new_m["adj_factor"] = intra_adj
+                curr_adj = intra_adj
         else:
             if not df_new_d.empty:
                 df_new_d["adj_factor"] = 1.0
@@ -332,8 +346,14 @@ class DailyUpdater:
                 df_new_m["adj_factor"] = 1.0
 
         # 持久化写回 security_info 的最新复权因子：
-        # 当日线实际入库推进，或盘中除权因子发生变更时，持久化新因子
-        persisted_adj = curr_adj if (not df_new_d.empty or adj_factor_changed) else latest_adj
+        # 当日线实际入库推进，或盘中除权因子发生变更时，持久化新因子；
+        # 同日盘中增量推进时复用 intra_adj
+        if not df_new_d.empty or adj_factor_changed:
+            persisted_adj = curr_adj
+        elif not df_new_m.empty and last_m is not None and last_m == target_date:
+            persisted_adj = float(last_m_adj) if (last_m_adj is not None and not pd.isna(last_m_adj)) else float(latest_adj)
+        else:
+            persisted_adj = latest_adj
 
         # 5. 计算日线快照
         df_d_snap = pd.DataFrame()
