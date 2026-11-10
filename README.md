@@ -5,7 +5,7 @@
 [![Numba](https://img.shields.io/badge/Numba-JIT-orange.svg)](https://numba.pydata.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A 股全市场高频多周期快照时序数据库。基于 **DuckDB 列式存储引擎** 与 **Numba JIT 规则 A（动态快照 + 已闭合桶前值锚定）增量计算引擎**，覆盖沪深两市全部 **5,335 只标的**（5,228 只 A 股个股 + 107 只核心指数与通达信行业指数），支持日线（1d, 2d, 4d, 8d, 16d, 32d）与 15 分钟线（15m, 30m, 60m, 120m）共 10 个周期的实时 KDJ 指标平铺，并具备幂等增量自动同步能力。
+A 股全市场高频多周期快照时序数据库。基于 **DuckDB 列式存储引擎** 与 **Numba JIT 规则 A（动态快照 + 已闭合桶前值锚定）增量计算引擎**，覆盖沪深两市全部 **5,335 只标的**（5,228 只 A 股个股 + 107 只核心指数与通达信行业指数），支持日线（1d, 2d, 4d, 8d, 16d, 32d, 64d）与 15 分钟线（15m, 30m, 60m, 120m）共 11 个周期的实时 KDJ 指标平铺，并具备幂等增量自动同步能力。
 
 ---
 
@@ -127,16 +127,17 @@ D:\DB\
 
 ### 3. 物理表 `daily_snapshot`（日线级多周期快照）
 - **主键**: `(symbol, trade_date)`
-- **覆盖周期**: `1d, 2d, 4d, 8d, 16d, 32d`（6 个周期平铺）
+- **覆盖周期**: `1d, 2d, 4d, 8d, 16d, 32d, 64d`（7 个周期平铺）
 - **前 11 列基础行情**:
   - `symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor`
-- **后续 48 列指标**（每个周期包含 8 个指标：`sk, sd, skxl, sdxl, mk, md, mkxl, mdxl`）：
+- **后续 56 列指标**（每个周期包含 8 个指标：`sk, sd, skxl, sdxl, mk, md, mkxl, mdxl`）：
   - `sk_1d, sd_1d, skxl_1d, sdxl_1d, mk_1d, md_1d, mkxl_1d, mdxl_1d`
   - `sk_2d, sd_2d, skxl_2d, sdxl_2d, mk_2d, md_2d, mkxl_2d, mdxl_2d`
   - `sk_4d, sd_4d, skxl_4d, sdxl_4d, mk_4d, md_4d, mkxl_4d, mdxl_4d`
   - `sk_8d, sd_8d, skxl_8d, sdxl_8d, mk_8d, md_8d, mkxl_8d, mdxl_8d`
   - `sk_16d, sd_16d, skxl_16d, sdxl_16d, mk_16d, md_16d, mkxl_16d, mdxl_16d`
   - `sk_32d, sd_32d, skxl_32d, sdxl_32d, mk_32d, md_32d, mkxl_32d, mdxl_32d`
+  - `sk_64d, sd_64d, skxl_64d, sdxl_64d, mk_64d, md_64d, mkxl_64d, mdxl_64d`
 
 ### 4. 物理表 `minute_snapshot`（15分钟级多周期快照）
 - **主键**: `(symbol, bar_end)`
@@ -150,14 +151,15 @@ D:\DB\
   - `sk_60m, sd_60m, skxl_60m, sdxl_60m, mk_60m, md_60m, mkxl_60m, mdxl_60m`
   - `sk_120m, sd_120m, skxl_120m, sdxl_120m, mk_120m, md_120m, mkxl_120m, mdxl_120m`
 
-### 5. 物理表 `incremental_state`（10 周期增量迭代中间状态）
+### 5. 物理表 `incremental_state`（11 周期增量迭代中间状态）
 - **主键**: `(symbol, period)`
+- **总行数**: 58,685 行（5,335 标的 × 11 周期，包含 7 个日线周期与 4 个分钟周期）
 - **说明**: 存储每只标的在各个周期下最近闭合桶的高低点滚动窗口（JSON 数组）及闭合终值，确保增量更新无缝衔接历史序列。
 
 | 字段名 | 类型 | 说明 |
 | :--- | :--- | :--- |
 | `symbol` | VARCHAR | 标的代码 |
-| `period` | VARCHAR | 周期标识 (`1d`, `2d`, `4d`, `8d`, `16d`, `32d`, `15m`, `30m`, `60m`, `120m`) |
+| `period` | VARCHAR | 周期标识 (`1d`, `2d`, `4d`, `8d`, `16d`, `32d`, `64d`, `15m`, `30m`, `60m`, `120m`) |
 | `last_closed_bucket_id` | INTEGER | 最近已闭合桶序号 |
 | `closed_highs_adj` | VARCHAR | 最近 104 个已闭合桶前复权最高价 (JSON Array) |
 | `closed_lows_adj` | VARCHAR | 最近 104 个已闭合桶前复权最低价 (JSON Array) |
@@ -173,7 +175,7 @@ D:\DB\
 | `updated_at` | TIMESTAMP | 状态最后更新时间 |
 
 ### 6. 便捷视图 `v_daily_qfq` 与 `v_minute_qfq`
-基于 `daily_snapshot` 和 `minute_snapshot` 动态关联 `security_info.latest_adj_factor`，提供即开即用的前复权行情与完整 48 / 32 列指标：
+基于 `daily_snapshot` 和 `minute_snapshot` 动态关联 `security_info.latest_adj_factor`，提供即开即用的前复权行情与完整 56 / 32 列指标：
 - `open_qfq = open * adj_factor / latest_adj_factor`
 - `high_qfq = high * adj_factor / latest_adj_factor`
 - `low_qfq = low * adj_factor / latest_adj_factor`
@@ -185,7 +187,7 @@ D:\DB\
 
 ### 1. 周期与桶结构定义
 - **日线系列**：以标的历史首根日线为起点编号 `bar_seq = 0, 1, 2...`。
-  - 周期 $N \in \{1, 2, 4, 8, 16, 32\}$：当 `(bar_seq + 1) % N == 0` 时，该桶宣告正式闭合。
+  - 周期 $N \in \{1, 2, 4, 8, 16, 32, 64\}$：当 `(bar_seq + 1) % N == 0` 时，该桶宣告正式闭合。
 - **15 分钟系列**：以交易日内标准槽位编号 `slot_seq \in [1, 16]`。
   - $15m$（每 1 槽闭合）、$30m$（槽号为偶数时闭合）、$60m$（槽号模 4 为 0 时闭合）、$120m$（槽号模 8 为 0 时闭合）。
 

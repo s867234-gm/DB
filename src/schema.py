@@ -75,6 +75,9 @@ CREATE TABLE IF NOT EXISTS daily_snapshot (
     -- 32d (8列)
     sk_32d DOUBLE, sd_32d DOUBLE, skxl_32d DOUBLE, sdxl_32d DOUBLE,
     mk_32d DOUBLE, md_32d DOUBLE, mkxl_32d DOUBLE, mdxl_32d DOUBLE,
+    -- 64d (8列)
+    sk_64d DOUBLE, sd_64d DOUBLE, skxl_64d DOUBLE, sdxl_64d DOUBLE,
+    mk_64d DOUBLE, md_64d DOUBLE, mkxl_64d DOUBLE, mdxl_64d DOUBLE,
     PRIMARY KEY (symbol, trade_date)
 );
 
@@ -110,7 +113,7 @@ CREATE TABLE IF NOT EXISTS minute_snapshot (
 -- 5. 增量计算状态表
 CREATE TABLE IF NOT EXISTS incremental_state (
     symbol VARCHAR NOT NULL,
-    period VARCHAR NOT NULL, -- '1d', '2d', '4d', '8d', '16d', '32d', '15m', '30m', '60m', '120m'
+    period VARCHAR NOT NULL, -- '1d', '2d', '4d', '8d', '16d', '32d', '64d', '15m', '30m', '60m', '120m'
     last_closed_bucket_id INTEGER NOT NULL,
     closed_highs_adj VARCHAR, -- JSON Array: 最近已闭合桶复权最高价 (最多104个)
     closed_lows_adj VARCHAR,  -- JSON Array: 最近已闭合桶复权最低价 (最多104个)
@@ -156,7 +159,8 @@ SELECT
     d.sk_4d, d.sd_4d, d.skxl_4d, d.sdxl_4d, d.mk_4d, d.md_4d, d.mkxl_4d, d.mdxl_4d,
     d.sk_8d, d.sd_8d, d.skxl_8d, d.sdxl_8d, d.mk_8d, d.md_8d, d.mkxl_8d, d.mdxl_8d,
     d.sk_16d, d.sd_16d, d.skxl_16d, d.sdxl_16d, d.mk_16d, d.md_16d, d.mkxl_16d, d.mdxl_16d,
-    d.sk_32d, d.sd_32d, d.skxl_32d, d.sdxl_32d, d.mk_32d, d.md_32d, d.mkxl_32d, d.mdxl_32d
+    d.sk_32d, d.sd_32d, d.skxl_32d, d.sdxl_32d, d.mk_32d, d.md_32d, d.mkxl_32d, d.mdxl_32d,
+    d.sk_64d, d.sd_64d, d.skxl_64d, d.sdxl_64d, d.mk_64d, d.md_64d, d.mkxl_64d, d.mdxl_64d
 FROM daily_snapshot d
 JOIN security_info s ON d.symbol = s.symbol;
 

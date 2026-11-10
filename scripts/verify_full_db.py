@@ -48,7 +48,8 @@ def verify_database(db_path: str = DEFAULT_DB_PATH):
             min(trade_date) as min_date,
             max(trade_date) as max_date,
             count(CASE WHEN sk_1d IS NULL OR isnan(sk_1d) THEN 1 END) as null_sk_1d,
-            count(CASE WHEN sk_32d IS NULL OR isnan(sk_32d) THEN 1 END) as null_sk_32d
+            count(CASE WHEN sk_32d IS NULL OR isnan(sk_32d) THEN 1 END) as null_sk_32d,
+            count(CASE WHEN sk_64d IS NULL OR isnan(sk_64d) THEN 1 END) as null_sk_64d
         FROM daily_snapshot
     """).fetchone()
     report_data['daily_stats'] = {
@@ -57,9 +58,10 @@ def verify_database(db_path: str = DEFAULT_DB_PATH):
         'min_date': str(d_stat[2]),
         'max_date': str(d_stat[3]),
         'null_sk_1d': d_stat[4],
-        'null_sk_32d': d_stat[5]
+        'null_sk_32d': d_stat[5],
+        'null_sk_64d': d_stat[6]
     }
-    print(f"日线快照 (daily_snapshot): {d_stat[0]:,} 行 | 覆盖标的: {d_stat[1]:,} | 日期: {d_stat[2]} ~ {d_stat[3]} | 空值异常数: {d_stat[4] + d_stat[5]}")
+    print(f"日线快照 (daily_snapshot): {d_stat[0]:,} 行 | 覆盖标的: {d_stat[1]:,} | 日期: {d_stat[2]} ~ {d_stat[3]} | 空值异常数: {d_stat[4] + d_stat[5] + d_stat[6]}")
 
     # 3. minute_snapshot 统计
     m_stat = conn.execute("""
@@ -94,8 +96,8 @@ def verify_database(db_path: str = DEFAULT_DB_PATH):
         'total_rows': inc_stat[0],
         'symbol_count': inc_stat[1]
     }
-    print(f"增量状态 (incremental_state): {inc_stat[0]:,} 行 (每标的 10 周期状态, 覆盖标的: {inc_stat[1]:,})")
-    assert inc_stat[0] == total_sec * 10, f"Error: Expected {total_sec * 10} incremental state rows, got {inc_stat[0]}!"
+    print(f"增量状态 (incremental_state): {inc_stat[0]:,} 行 (每标的 11 周期状态, 覆盖标的: {inc_stat[1]:,})")
+    assert inc_stat[0] == total_sec * 11, f"Error: Expected {total_sec * 11} incremental state rows, got {inc_stat[0]}!"
 
     # 5. 核心样本标的真实前复权视图查询验证 (2024-10-08 与 2026-10-30)
     samples_verification = {}

@@ -259,3 +259,48 @@ def test_column_alignment_and_by_name_insertion():
 
     mem_conn.close()
 
+
+def test_64d_period_bucket_closing_and_incremental():
+    """测试 64d 周期的分桶闭合规则与分段增量计算精度"""
+    # 构造 150 根模拟日线数据 (bar_seq 从 0 到 149)
+    df = generate_mock_daily_data(n_bars=150, seed=777)
+    df['bar_seq'] = np.arange(len(df), dtype=np.int32)
+
+    # 1. 全量计算
+    df_full, full_states = MultiCycleKDJEngine.compute_daily_snapshot(df)
+
+    # 断言包含 64d 的全部 8 列
+    expected_64d_cols = [f"{metric}_64d" for metric in ['sk', 'sd', 'skxl', 'sdxl', 'mk', 'md', 'mkxl', 'mdxl']]
+    for c in expected_64d_cols:
+        assert c in df_full.columns, f"Missing 64d column: {c}"
+
+    # 断言 64d 状态:
+    # bar_seq = 0..63 为桶 0，64..127 为桶 1，共 2 个已闭合桶 (last_closed_bucket_id == 1)
+    # bar_count == 150 - 128 = 22
+    st_64d = full_states['64d']
+    assert st_64d.last_closed_bucket_id == 1
+    assert st_64d.bar_count == 22
+    assert len(st_64d.closed_highs_adj) == 2
+    assert len(st_64d.closed_lows_adj) == 2
+
+    # 2. 分段增量计算 (前 100 根 + 后 50 根)
+    split = 100
+    df_part1, states_part1 = MultiCycleKDJEngine.compute_daily_snapshot(df.iloc[:split])
+    df_part2, states_part2 = MultiCycleKDJEngine.compute_daily_snapshot(df.iloc[split:], init_states=states_part1)
+    df_inc = pd.concat([df_part1, df_part2], ignore_index=True)
+
+    # 验证 64d 全部 8 列指标的最大绝对误差 < 1e-12
+    for c in expected_64d_cols:
+        diff = np.max(np.abs(df_full[c].to_numpy() - df_inc[c].to_numpy()))
+        assert diff < 1e-12, f"64d metric discrepancy in {c}: max_diff={diff}"
+
+    # 验证分段计算得到的最新状态与全量一致
+    st_inc_64d = states_part2['64d']
+    assert st_64d.last_closed_bucket_id == st_inc_64d.last_closed_bucket_id
+    assert st_64d.bar_count == st_inc_64d.bar_count
+    assert np.isclose(st_64d.sk_closed, st_inc_64d.sk_closed)
+    assert np.isclose(st_64d.sd_closed, st_inc_64d.sd_closed)
+    assert np.isclose(st_64d.mk_closed, st_inc_64d.mk_closed)
+    assert np.isclose(st_64d.md_closed, st_inc_64d.md_closed)
+
+

@@ -47,3 +47,6 @@ repomix.config.json
 .idea/
 .DS_Store
 *.swp
+
+# CodeGraph
+.codegraph/
