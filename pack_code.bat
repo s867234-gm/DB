@@ -1,9 +1,11 @@
 @echo off
+setlocal
+cd /d "%~dp0"
 chcp 65001 >nul
 echo ======================================================================
 echo   A_DB 全量代码库打包工具 (Repomix)
 echo ======================================================================
-npx repomix
+call npx repomix
 if %ERRORLEVEL% EQU 0 (
     echo ======================================================================
     echo   [成功] 代码库打包完成: repomix-full-codebase.xml
