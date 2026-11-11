@@ -217,6 +217,19 @@ class TdxConnectionPool:
                         "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
                         "reason": "xdxr_none",
                     }
+                if hasattr(api, "get_finance_info"):
+                    fin = api.get_finance_info(0, "000001")
+                    try:
+                        fin_ltgb = float(fin.get("liutongguben") or 0) if isinstance(fin, dict) else 0.0
+                    except (TypeError, ValueError):
+                        fin_ltgb = 0.0
+                    if not isinstance(fin, dict) or not math.isfinite(fin_ltgb) or fin_ltgb <= 0:
+                        return {
+                            "server": server,
+                            "ok": False,
+                            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+                            "reason": "finance_invalid",
+                        }
                 return {
                     "server": server,
                     "ok": True,
@@ -592,13 +605,16 @@ class TdxFetcher:
                 t_rpc = time.perf_counter()
                 info = api.get_finance_info(market, code)
                 rpc_elapsed = time.perf_counter() - t_rpc
-                if rpc_elapsed > 1.8 and hasattr(self.pool, "record_server_error"):
-                    self.pool.record_server_error(curr_server, f"finance_slow:{rpc_elapsed:.2f}s")
-                if info is None or not isinstance(info, dict):
+                is_slow = rpc_elapsed > 1.8
+                if is_slow:
                     if hasattr(self.pool, "record_server_error"):
-                        self.pool.record_server_error(curr_server, "finance_none")
+                        self.pool.record_server_error(curr_server, f"finance_slow:{rpc_elapsed:.2f}s")
                     self.pool.disconnect_thread()
+                if info is None or not isinstance(info, dict):
+                    # 单只退市或特殊股票无财务数据时不误伤健康节点；首次返回空时换连另一节点重试一次
                     if retry == 0:
+                        if not is_slow:
+                            self.pool.disconnect_thread()
                         continue
                     return None
                 return info
@@ -627,6 +643,40 @@ def extract_liutongguben(info: Optional[Dict]) -> Optional[float]:
     if not math.isfinite(fval) or fval <= 0.0:
         return None
     return fval
+
+
+def extract_liutongguben_from_xdxr(events: Optional[List[Dict]]) -> Optional[float]:
+    """从除权/股本变动事件列表中提取最新有效流通股本（事件单位为万股，自动换算为股）；无有效记录返回 None。"""
+    if not events:
+        return None
+
+    def _date_key(ev: Dict) -> Tuple[int, int, int]:
+        if not isinstance(ev, dict):
+            return (0, 0, 0)
+        try:
+            return (
+                int(ev.get("year") or 0),
+                int(ev.get("month") or 0),
+                int(ev.get("day") or 0),
+            )
+        except (TypeError, ValueError):
+            return (0, 0, 0)
+
+    sorted_events = sorted((e for e in events if isinstance(e, dict)), key=_date_key)
+    latest_val: Optional[float] = None
+    for ev in sorted_events:
+        for field in ("panhouliutong", "houliutong"):
+            raw_val = ev.get(field)
+            if raw_val is None:
+                continue
+            try:
+                fval = float(raw_val)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(fval) and fval > 0.0:
+                latest_val = fval * 10000.0
+                break
+    return latest_val
 
 
 def is_stock_symbol(symbol: str) -> bool:

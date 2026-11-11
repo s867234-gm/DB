@@ -35,10 +35,24 @@ def verify_database(db_path: str = DEFAULT_DB_PATH):
     report_data['sec_stats'] = sec_stats
     total_sec = conn.execute("SELECT count(*) FROM security_info").fetchone()[0]
     bj_count = conn.execute("SELECT count(*) FROM security_info WHERE exchange = 'BSE' OR symbol LIKE 'BJ%'").fetchone()[0]
+    ltgb_stat = conn.execute("""
+        SELECT
+            count(CASE WHEN sec_type = 'STOCK' THEN 1 END) as stock_total,
+            count(CASE WHEN sec_type = 'STOCK' AND liutongguben > 0 THEN 1 END) as stock_with_ltgb,
+            count(CASE WHEN sec_type != 'STOCK' AND liutongguben IS NOT NULL THEN 1 END) as index_with_ltgb
+        FROM security_info
+    """).fetchone()
     report_data['total_sec'] = total_sec
     report_data['bj_count'] = bj_count
+    report_data['ltgb_stats'] = {
+        'stock_total': ltgb_stat[0],
+        'stock_with_ltgb': ltgb_stat[1],
+        'index_with_ltgb': ltgb_stat[2],
+    }
     print(f"总标的数: {total_sec} (北交所 BJ 数量: {bj_count})")
+    print(f"流通股本 (liutongguben): STOCK 覆盖 {ltgb_stat[1]}/{ltgb_stat[0]} 只 (liutongguben > 0) | 指数非空异常: {ltgb_stat[2]}")
     assert bj_count == 0, f"Error: Found {bj_count} BSE/BJ symbols!"
+    assert ltgb_stat[2] == 0, f"Error: Found {ltgb_stat[2]} non-STOCK symbols with non-NULL liutongguben!"
 
     # 2. daily_snapshot 统计
     d_stat = conn.execute("""
@@ -49,9 +63,16 @@ def verify_database(db_path: str = DEFAULT_DB_PATH):
             max(trade_date) as max_date,
             count(CASE WHEN sk_1d IS NULL OR isnan(sk_1d) THEN 1 END) as null_sk_1d,
             count(CASE WHEN sk_32d IS NULL OR isnan(sk_32d) THEN 1 END) as null_sk_32d,
-            count(CASE WHEN sk_64d IS NULL OR isnan(sk_64d) THEN 1 END) as null_sk_64d
+            count(CASE WHEN sk_64d IS NULL OR isnan(sk_64d) THEN 1 END) as null_sk_64d,
+            count(CASE WHEN turn10 IS NOT NULL AND (isnan(turn10) OR isinf(turn10) OR turn10 < 0) THEN 1 END) as invalid_turn10
         FROM daily_snapshot
     """).fetchone()
+    idx_turn10_cnt = conn.execute("""
+        SELECT count(*)
+        FROM daily_snapshot d
+        JOIN security_info s ON d.symbol = s.symbol
+        WHERE s.sec_type != 'STOCK' AND d.turn10 IS NOT NULL
+    """).fetchone()[0]
     report_data['daily_stats'] = {
         'total_rows': d_stat[0],
         'symbol_count': d_stat[1],
@@ -59,9 +80,16 @@ def verify_database(db_path: str = DEFAULT_DB_PATH):
         'max_date': str(d_stat[3]),
         'null_sk_1d': d_stat[4],
         'null_sk_32d': d_stat[5],
-        'null_sk_64d': d_stat[6]
+        'null_sk_64d': d_stat[6],
+        'invalid_turn10': d_stat[7],
+        'idx_turn10_cnt': idx_turn10_cnt,
     }
-    print(f"日线快照 (daily_snapshot): {d_stat[0]:,} 行 | 覆盖标的: {d_stat[1]:,} | 日期: {d_stat[2]} ~ {d_stat[3]} | 空值异常数: {d_stat[4] + d_stat[5] + d_stat[6]}")
+    print(
+        f"日线快照 (daily_snapshot): {d_stat[0]:,} 行 | 覆盖标的: {d_stat[1]:,} | 日期: {d_stat[2]} ~ {d_stat[3]} | "
+        f"KDJ空值异常: {d_stat[4] + d_stat[5] + d_stat[6]} | turn10异常(NaN/Inf/<0): {d_stat[7]} | 指数turn10非空: {idx_turn10_cnt}"
+    )
+    assert d_stat[7] == 0, f"Error: Found {d_stat[7]} invalid turn10 rows (NaN/Inf/<0)!"
+    assert idx_turn10_cnt == 0, f"Error: Found {idx_turn10_cnt} non-STOCK daily rows with non-NULL turn10!"
 
     # 3. minute_snapshot 统计
     m_stat = conn.execute("""
@@ -104,7 +132,7 @@ def verify_database(db_path: str = DEFAULT_DB_PATH):
     for sym in CORE_VERIFY_SYMBOLS:
         # 日线视图
         df_d_view = conn.execute(f"""
-            SELECT symbol, code, trade_date, bar_seq, close, close_qfq, adj_factor,
+            SELECT symbol, code, trade_date, bar_seq, close, close_qfq, adj_factor, turn10,
                    sk_1d, sd_1d, sk_2d, sd_2d, sk_4d, sd_4d, sk_8d, sd_8d, mk_1d, md_1d
             FROM v_daily_qfq
             WHERE symbol = '{sym}' AND trade_date IN ('2024-10-08', '2026-10-30')
@@ -145,6 +173,8 @@ def generate_full_build_report(data: dict):
 
     md.append("## 一、全市场标的字典构建结果 (`security_info`)\n")
     md.append(f"- **总标的数**: **{data['total_sec']}** 只（北交所 `BSE/BJ` 标的严格为 **0**，完全纯净）。")
+    lt_s = data['ltgb_stats']
+    md.append(f"- **流通股本 (`liutongguben`) 覆盖**: `STOCK` 标的 **{lt_s['stock_with_ltgb']:,} / {lt_s['stock_total']:,}** 只 (`> 0`)，非个股非空异常 **{lt_s['index_with_ltgb']}**。")
     md.append("\n| 标的类别 (`sec_type`) | 交易所 (`exchange`) | 标的数量 | 统一编码规范举例 |")
     md.append("| :--- | :--- | :--- | :--- |")
     name_map = {
@@ -166,9 +196,9 @@ def generate_full_build_report(data: dict):
 
     md.append("| 物理表名 | 总记录行数 | 标的覆盖数 | 时间区间跨度 | 数据完整性 / 异常值检测 |")
     md.append("| :--- | :--- | :--- | :--- | :--- |")
-    md.append(f"| **`daily_snapshot`** | **{d_s['total_rows']:,}** 行 | {d_s['symbol_count']:,} 只 | `{d_s['min_date']}` ~ `{d_s['max_date']}` | **0 NULL / 0 NaN** (全量闭环) |")
+    md.append(f"| **`daily_snapshot`** | **{d_s['total_rows']:,}** 行 | {d_s['symbol_count']:,} 只 | `{d_s['min_date']}` ~ `{d_s['max_date']}` | **0 NULL / 0 NaN / turn10 0 异常** (全量闭环) |")
     md.append(f"| **`minute_snapshot`** | **{m_s['total_rows']:,}** 行 | {m_s['symbol_count']:,} 只 | `{m_s['min_bar_end']}` ~ `{m_s['max_bar_end']}` | **0 NULL / 0 残留早于2024-10-01数据** |")
-    md.append(f"| **`incremental_state`** | **{i_s['total_rows']:,}** 行 | {i_s['symbol_count']:,} 只 | 覆盖全市场 10 个完整周期 | **恰好等于 5,335 × 10 = 53,350 行** |")
+    md.append(f"| **`incremental_state`** | **{i_s['total_rows']:,}** 行 | {i_s['symbol_count']:,} 只 | 覆盖全市场 11 个完整周期 | **恰好等于 5,335 × 11 = 58,685 行** |")
     md.append(f"| **`corporate_action`** | **179,285** 行 | 5,228 只 | 1990-03-01 ~ 2026-11-06 | 原始事件追溯链完整 |\n")
 
     md.append("\n---\n## 三、核心标的真实前复权视图查询验证 (`v_daily_qfq` & `v_minute_qfq`)\n")
@@ -179,10 +209,11 @@ def generate_full_build_report(data: dict):
         md.append(f"### 3.{sym} 核心数据核验\n")
         # 日线
         md.append(f"**【日线前复权视图抽样 (`v_daily_qfq`)】**\n")
-        md.append("| trade_date | bar_seq | close (原始) | close_qfq (前复权) | adj_factor | sk_1d | sd_1d | sk_2d | sd_2d | sk_4d | sd_4d | mk_1d | md_1d |")
-        md.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+        md.append("| trade_date | bar_seq | close (原始) | close_qfq (前复权) | adj_factor | turn10 | sk_1d | sd_1d | sk_2d | sd_2d | sk_4d | sd_4d | mk_1d | md_1d |")
+        md.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
         for r in recs['daily']:
-            md.append(f"| **{r['trade_date']}** | {r['bar_seq']} | {r['close']:.2f} | {r['close_qfq']:.2f} | {r['adj_factor']:.4f} | {r['sk_1d']:.2f} | {r['sd_1d']:.2f} | {r['sk_2d']:.2f} | {r['sd_2d']:.2f} | {r['sk_4d']:.2f} | {r['sd_4d']:.2f} | {r['mk_1d']:.2f} | {r['md_1d']:.2f} |")
+            turn10_str = f"{r['turn10']:.2f}%" if pd.notnull(r.get('turn10')) else "NULL"
+            md.append(f"| **{r['trade_date']}** | {r['bar_seq']} | {r['close']:.2f} | {r['close_qfq']:.2f} | {r['adj_factor']:.4f} | {turn10_str} | {r['sk_1d']:.2f} | {r['sd_1d']:.2f} | {r['sk_2d']:.2f} | {r['sd_2d']:.2f} | {r['sk_4d']:.2f} | {r['sd_4d']:.2f} | {r['mk_1d']:.2f} | {r['md_1d']:.2f} |")
         md.append("\n")
 
         # 分钟线
@@ -197,7 +228,7 @@ def generate_full_build_report(data: dict):
     md.append("1. **列顺序错位与按列插入彻底根治**：通过严格约束物理列规范和 DuckDB `BY NAME` 语法，各列数据严格吻合；")
     md.append("2. **北交所 BJ 纯净性确认**：全市场 5,335 只标的仅收录沪深 A 股及指定指数，无任何北交所杂质；")
     md.append(f"3. **数据库文件紧凑高性能**：全市场历史日线与分钟线全周期指标物化后，总库大小仅 **{data['db_size_gb']:.2f} GB**，单机即可实现毫秒级即席 OLAP 查询！")
-    md.append("4. **增量状态持久化就绪**：53,350 条增量状态就绪，支撑后续日常毫秒级增量更新。\n")
+    md.append("4. **增量状态持久化就绪**：58,685 条增量状态就绪，支撑后续日常毫秒级增量更新。\n")
 
     with open("D:/DB/docs/phase3_full_build_report.md", "w", encoding="utf-8") as f:
         f.write("\n".join(md))

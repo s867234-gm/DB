@@ -104,9 +104,17 @@ def run_pilot():
         # ----------------------------------------------------
         # 3. 计算日线多周期快照
         # ----------------------------------------------------
+        ltgb_row = target_conn.execute(
+            "SELECT liutongguben FROM security_info WHERE symbol = ?",
+            [sym_new],
+        ).fetchone()
+        ltgb_val = float(ltgb_row[0]) if (ltgb_row and ltgb_row[0] is not None and sec_type == 'STOCK') else None
+
         df_daily_raw['bar_seq'] = np.arange(len(df_daily_raw), dtype=np.int32)
         t0 = time.perf_counter()
-        df_daily_snap, d_states = MultiCycleKDJEngine.compute_daily_snapshot(df_daily_raw)
+        df_daily_snap, d_states = MultiCycleKDJEngine.compute_daily_snapshot(
+            df_daily_raw, liutongguben=ltgb_val
+        )
         t_daily_calc = time.perf_counter() - t0
         sym_perf['daily_calc_s'] = t_daily_calc
         total_calc_time += t_daily_calc
@@ -204,8 +212,16 @@ def run_pilot():
         split_idx = len(df_daily_raw) - 30
         df_d_base = df_daily_raw.iloc[:split_idx]
         df_d_tail = df_daily_raw.iloc[split_idx:]
-        _, base_states = MultiCycleKDJEngine.compute_daily_snapshot(df_d_base)
-        df_tail_inc, inc_states = MultiCycleKDJEngine.compute_daily_snapshot(df_d_tail, init_states=base_states)
+        _, base_states = MultiCycleKDJEngine.compute_daily_snapshot(
+            df_d_base, liutongguben=ltgb_val
+        )
+        prev_vols = df_d_base['volume'].iloc[-9:].tolist()
+        df_tail_inc, inc_states = MultiCycleKDJEngine.compute_daily_snapshot(
+            df_d_tail,
+            init_states=base_states,
+            prev_volumes=prev_vols,
+            liutongguben=ltgb_val,
+        )
 
         max_daily_err = 0.0
         for p in DAILY_PERIOD_NAMES:

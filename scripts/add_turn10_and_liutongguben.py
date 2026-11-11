@@ -17,10 +17,11 @@ scripts/add_turn10_and_liutongguben.py —— A_DB 扩展流通股本 (liutonggu
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import math
 import os
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import duckdb
 import pandas as pd
@@ -34,7 +35,11 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from src.fetcher import TdxFetcher, extract_liutongguben
+from src.fetcher import (
+    TdxFetcher,
+    extract_liutongguben,
+    extract_liutongguben_from_xdxr,
+)
 from src.schema import DEFAULT_DB_PATH, SOURCE_DB_PATH, VIEWS_DDL
 
 DEFAULT_LOCK_PATH = os.path.join(project_root, "logs", "update.lock")
@@ -115,8 +120,9 @@ def populate_liutongguben(
     con: duckdb.DuckDBPyConnection,
     workers: int = 24,
     only_missing: bool = False,
+    source_db_path: str = SOURCE_DB_PATH,
 ) -> Tuple[int, int]:
-    """并发拉取全市场个股最新流通股本 (liutongguben) 并写入 security_info"""
+    """并发拉取全市场个股最新流通股本 (liutongguben) 并写入 security_info（含 xdxr 与 v1 历史反推兜底）"""
     t0 = time.perf_counter()
     where_clause = "sec_type = 'STOCK' AND liutongguben IS NULL" if only_missing else "sec_type = 'STOCK'"
     stocks_df = con.execute(f"""
@@ -145,24 +151,111 @@ def populate_liutongguben(
     fetcher = TdxFetcher()
     fetcher.refresh_server_pool()
 
+    def _fetch_ltgb(sym: str) -> Tuple[Optional[float], str]:
+        info = fetcher.fetch_finance_info(sym)
+        val = extract_liutongguben(info)
+        if val is not None:
+            return val, "finance"
+        # 二级兜底：从除权/股本变动事件提取最新有效流通股本
+        events = fetcher.fetch_xdxr_events(sym)
+        val_xdxr = extract_liutongguben_from_xdxr(events)
+        if val_xdxr is not None:
+            return val_xdxr, "xdxr"
+        return None, "missing"
+
     updates = []
-    null_syms = []
+    missing_after_tier2 = []
+    xdxr_fallback_syms = []
+    v1_fallback_syms = []
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(fetcher.fetch_finance_info, sym): sym for sym in symbols}
+        futures = {executor.submit(_fetch_ltgb, sym): sym for sym in symbols}
         for fut in as_completed(futures):
             sym = futures[fut]
             try:
-                info = fut.result()
-                val = extract_liutongguben(info)
+                val, src = fut.result()
                 if val is not None:
+                    if src == "xdxr":
+                        xdxr_fallback_syms.append(sym)
                     prev_val = existing_map.get(sym)
                     if prev_val is None or abs(val - prev_val) > 1e-3:
                         updates.append({"symbol": sym, "liutongguben": val})
                 else:
-                    null_syms.append(sym)
+                    missing_after_tier2.append(sym)
             except Exception as e:
                 logger.warning(f"{sym} 获取流通股本异常: {e}")
-                null_syms.append(sym)
+                missing_after_tier2.append(sym)
+
+    # 三级兜底：若仍缺失，从源库 v1 历史最新有效 turn10 反推流通股本（股）
+    null_syms: List[str] = []
+    if missing_after_tier2 and source_db_path and os.path.exists(source_db_path):
+        src_sql_path = source_db_path.replace("\\", "/")
+        attached_v1 = False
+        try:
+            con.execute(f"ATTACH '{src_sql_path}' AS v1_ltgb (READ_ONLY);")
+            attached_v1 = True
+            con.register("tmp_ltgb_missing", pd.DataFrame({"symbol": missing_after_tier2}))
+            inferred_rows = con.execute("""
+                WITH win AS (
+                    SELECT
+                        d.symbol,
+                        d.bar_seq,
+                        d.trade_date,
+                        SUM(d.volume) OVER w AS sum_10_vol,
+                        COUNT(d.volume) OVER w AS valid_cnt,
+                        COUNT(*) OVER w AS win_cnt
+                    FROM daily_snapshot d
+                    JOIN tmp_ltgb_missing m ON d.symbol = m.symbol
+                    WINDOW w AS (
+                        PARTITION BY d.symbol ORDER BY d.bar_seq ASC
+                        ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+                    )
+                )
+                SELECT
+                    w.symbol,
+                    ROUND((w.sum_10_vol * 10000.0) / v1.turn10) AS inferred_ltgb
+                FROM win w
+                JOIN v1_ltgb.stock_daily_feature_snapshot v1
+                  ON w.symbol = v1.symbol
+                 AND CAST(w.trade_date AS TIMESTAMP) = v1.trade_date
+                WHERE w.valid_cnt = w.win_cnt
+                  AND w.sum_10_vol > 0
+                  AND v1.turn10 IS NOT NULL
+                  AND NOT isnan(v1.turn10)
+                  AND NOT isinf(v1.turn10)
+                  AND v1.turn10 > 0
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY w.symbol ORDER BY w.bar_seq DESC) = 1
+            """).fetchall()
+            con.unregister("tmp_ltgb_missing")
+
+            inferred_map: Dict[str, float] = {}
+            for sym_i, val_i in inferred_rows:
+                if val_i is not None:
+                    f_val = float(val_i)
+                    if math.isfinite(f_val) and f_val > 0.0:
+                        inferred_map[sym_i] = f_val
+
+            for sym in missing_after_tier2:
+                val_v1 = inferred_map.get(sym)
+                if val_v1 is not None:
+                    v1_fallback_syms.append(sym)
+                    prev_val = existing_map.get(sym)
+                    if prev_val is None or abs(val_v1 - prev_val) > 1e-3:
+                        updates.append({"symbol": sym, "liutongguben": val_v1})
+                else:
+                    null_syms.append(sym)
+        finally:
+            try:
+                con.unregister("tmp_ltgb_missing")
+            except Exception:
+                pass
+            if attached_v1:
+                try:
+                    con.execute("DETACH v1_ltgb;")
+                except Exception:
+                    pass
+    else:
+        null_syms = list(missing_after_tier2)
 
     con.execute("BEGIN TRANSACTION;")
     if updates:
@@ -183,7 +276,9 @@ def populate_liutongguben(
     active_nulls = [s for s in null_syms if s not in delisted_syms]
     elapsed = time.perf_counter() - t0
     logger.info(
-        f"流通股本采集完成: 总个股={len(symbols)}, 更新写入={len(updates)}, "
+        f"流通股本采集完成: 总个股={len(symbols)}, 更新写入={len(updates)} "
+        f"(xdxr兜底={len(xdxr_fallback_syms)}: {xdxr_fallback_syms[:10]}, "
+        f"v1反推兜底={len(v1_fallback_syms)}: {v1_fallback_syms[:10]}), "
         f"返回<=0/空={len(null_syms)} (其中非退市={len(active_nulls)}: {active_nulls[:10]}), 耗时={elapsed:.2f}s"
     )
     return len(symbols), len(updates)
@@ -250,7 +345,11 @@ def backfill_turn10(
                     SELECT
                         c.symbol,
                         c.trade_date,
-                        CASE WHEN v1.symbol IS NOT NULL THEN v1.turn10 ELSE c.calc_turn10 END AS new_turn10
+                        CASE
+                            WHEN v1.turn10 IS NOT NULL AND NOT isnan(v1.turn10) AND NOT isinf(v1.turn10)
+                            THEN v1.turn10
+                            ELSE c.calc_turn10
+                        END AS new_turn10
                     FROM sym_calc c
                     LEFT JOIN v1.stock_daily_feature_snapshot v1
                         ON c.symbol = v1.symbol
@@ -352,7 +451,12 @@ def run_migration(
         con.execute("PRAGMA threads=8;")
 
         upgrade_schema_and_views(con)
-        populate_liutongguben(con, workers=workers, only_missing=only_missing_ltgb)
+        populate_liutongguben(
+            con,
+            workers=workers,
+            only_missing=only_missing_ltgb,
+            source_db_path=source_db_path,
+        )
         backfill_turn10(con, source_db_path=source_db_path, batch_size=batch_size)
 
         logger.info("执行最终数据库 CHECKPOINT...")

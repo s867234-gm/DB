@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from src.schema import DEFAULT_DB_PATH, SOURCE_DB_PATH, init_database
+from src.fetcher import extract_liutongguben
 from src.kdj_engine import (
     MultiCycleKDJEngine, PeriodState,
     DAILY_SNAPSHOT_COLUMNS, MINUTE_SNAPSHOT_COLUMNS
@@ -39,7 +40,7 @@ class FullMarketBuilder:
         tgt_conn = duckdb.connect(self.db_path, read_only=True)
         # 1. 全部标的
         all_secs = tgt_conn.execute("""
-            SELECT symbol, code, name, sec_type, exchange
+            SELECT symbol, code, name, sec_type, exchange, liutongguben
             FROM security_info
             ORDER BY symbol ASC
         """).df()
@@ -64,12 +65,14 @@ class FullMarketBuilder:
             if sym in done_syms:
                 continue
             src_sym = row['code'] if row['sec_type'] != 'STOCK' else sym
+            ltgb = extract_liutongguben({"liutongguben": row.get('liutongguben')}) if row['sec_type'] == 'STOCK' else None
             records.append({
                 'symbol': sym,
                 'code': row['code'],
                 'name': row['name'],
                 'sec_type': row['sec_type'],
                 'exchange': row['exchange'],
+                'liutongguben': ltgb,
                 'source_symbol': src_sym
             })
 
@@ -94,7 +97,9 @@ class FullMarketBuilder:
         if df_d_sym is not None and len(df_d_sym) > 0:
             df_d_sym = df_d_sym.sort_values('trade_date').reset_index(drop=True)
             df_d_sym['bar_seq'] = np.arange(len(df_d_sym), dtype=np.int32)
-            d_snap_df, d_states = MultiCycleKDJEngine.compute_daily_snapshot(df_d_sym)
+            d_snap_df, d_states = MultiCycleKDJEngine.compute_daily_snapshot(
+                df_d_sym, liutongguben=sym_dict.get('liutongguben')
+            )
             latest_adj = float(df_d_sym['adj_factor'].iloc[-1])
             for st in d_states.values():
                 inc_rows.append(st.to_db_row(updated_at=now_ts))

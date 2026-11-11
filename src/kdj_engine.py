@@ -349,6 +349,7 @@ class MultiCycleKDJEngine:
             win = all_vols[max(0, idx - 9) : idx + 1]
             if not np.isnan(win).any():
                 out[t] = (float(np.sum(win)) * 10000.0) / ltgb
+        out[~np.isfinite(out)] = np.nan
         return out
 
     @staticmethod

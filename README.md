@@ -255,26 +255,28 @@ python scripts/run_daily_update.py --workers 24 --batch-size 500
 ### 1. 极速查询单只标的前复权日线与多周期指标
 ```sql
 SELECT 
-    symbol, trade_date, open_qfq, high_qfq, low_qfq, close_qfq, volume,
+    symbol, trade_date, open_qfq, high_qfq, low_qfq, close_qfq, volume, turn10, liutongguben,
     sk_1d, sd_1d, skxl_1d,
     sk_4d, sd_4d, skxl_4d,
-    sk_16d, sd_16d, skxl_16d
+    sk_16d, sd_16d, skxl_16d,
+    sk_64d, sd_64d, skxl_64d
 FROM v_daily_qfq
 WHERE symbol = 'SZ000001'
 ORDER BY trade_date DESC
 LIMIT 10;
 ```
 
-### 2. 10 周期 KDJ 共振金叉强势选股实战 SQL
-在量化多周期策略中，当**大周期处于上升趋势（多头向上）**且**中小周期同时出现金叉或斜率共振**时，通常代表极强的动量爆发点。以下 SQL 可直接在 DuckDB 中毫秒级筛选出日线（1d, 4d, 16d）与分钟线（15m, 60m）共振向上的标的：
+### 2. 11 周期 KDJ 共振金叉强势选股实战 SQL
+在量化多周期策略中，当**大周期处于上升趋势（多头向上）**且**中小周期同时出现金叉或斜率共振**时，通常代表极强的动量爆发点。以下 SQL 可直接在 DuckDB 中毫秒级筛选出日线（1d, 4d, 16d, 64d）与分钟线（15m, 60m）共振向上的标的：
 
 ```sql
 WITH latest_daily AS (
     SELECT 
-        symbol, trade_date, close,
+        symbol, trade_date, close, turn10,
         sk_1d, sd_1d, skxl_1d,
         sk_4d, sd_4d, skxl_4d,
-        sk_16d, sd_16d, skxl_16d
+        sk_16d, sd_16d, skxl_16d,
+        sk_64d, sd_64d, skxl_64d
     FROM daily_snapshot
     WHERE trade_date = (SELECT MAX(trade_date) FROM daily_snapshot)
 ),
@@ -284,23 +286,22 @@ latest_minute AS (
         sk_15m, sd_15m, skxl_15m,
         sk_60m, sd_60m, skxl_60m
     FROM minute_snapshot
-    WHERE (trading_date, slot_seq) = (
-        SELECT trading_date, slot_seq 
-        FROM minute_snapshot 
-        ORDER BY trading_date DESC, slot_seq DESC 
-        LIMIT 1
-    )
+    WHERE bar_end = (SELECT MAX(bar_end) FROM minute_snapshot)
 )
 SELECT 
     s.symbol,
     s.name,
     s.board,
+    s.liutongguben,
     d.close AS latest_close,
+    ROUND(d.turn10, 2) AS turn10,
     -- 日线指标
     ROUND(d.sk_1d, 2) AS sk_1d,
     ROUND(d.sd_1d, 2) AS sd_1d,
     ROUND(d.sk_4d, 2) AS sk_4d,
     ROUND(d.sk_16d, 2) AS sk_16d,
+    ROUND(d.sk_64d, 2) AS sk_64d,
+    ROUND(d.sd_64d, 2) AS sd_64d,
     -- 分钟指标
     ROUND(m.sk_15m, 2) AS sk_15m,
     ROUND(m.sk_60m, 2) AS sk_60m

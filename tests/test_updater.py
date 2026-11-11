@@ -17,6 +17,7 @@ from src.fetcher import (
     TdxFetcher,
     calculate_next_adj_factor,
     extract_liutongguben,
+    extract_liutongguben_from_xdxr,
     parse_daily_bars_to_df,
     parse_minute_bars_to_df,
 )
@@ -1382,6 +1383,181 @@ def test_migration_add_turn10_and_liutongguben(tmp_path):
     changed2 = backfill_turn10(con, source_db_path=v1_file, batch_size=500)
     assert changed2 == 0
     con.close()
+
+
+def test_extract_liutongguben_from_xdxr_and_fallbacks(tmp_path, monkeypatch):
+    """测试 extract_liutongguben_from_xdxr、节点财务预检、空值防误伤熔断与 DailyUpdater 兜底"""
+    # 1. extract_liutongguben_from_xdxr 单元测试
+    assert extract_liutongguben_from_xdxr(None) is None
+    assert extract_liutongguben_from_xdxr([]) is None
+    assert extract_liutongguben_from_xdxr([{"year": 2025, "month": 1, "day": 1, "panhouliutong": 0.0}]) is None
+    assert extract_liutongguben_from_xdxr([{"year": 2025, "month": 1, "day": 1, "panhouliutong": float("nan")}]) is None
+    assert extract_liutongguben_from_xdxr([{"year": 2025, "month": 1, "day": 1, "houliutong": 5000.0}]) == 50_000_000.0
+
+    # 乱序日期 + 后续纯分红事件不应覆盖最新有效股本（单位: 万股 -> 股）
+    events_mix = [
+        {"year": 2026, "month": 6, "day": 1, "category": 1, "panhouliutong": 0.0},
+        {"year": 2025, "month": 12, "day": 31, "category": 5, "panhouliutong": 10126.25},
+        {"year": 2022, "month": 4, "day": 22, "category": 5, "panhouliutong": 8000.0},
+    ]
+    assert extract_liutongguben_from_xdxr(events_mix) == 101_262_500.0
+
+    # 2. _probe_one 财务接口预检与 fetch_finance_info 不误伤健康节点
+    servers = [
+        ("10.0.0.1", 7709, "bad_fin"),
+        ("10.0.0.2", 7709, "good_fin"),
+    ]
+
+    class ProbeFinApi:
+        def __init__(self, heartbeat=False):
+            self.ip = None
+            self.client = None
+
+        def connect(self, ip, port, time_out=2.0):
+            self.ip = ip
+            self.client = object()
+            return True
+
+        def disconnect(self):
+            self.client = None
+
+        def get_security_bars(self, category, market, code, start, count):
+            return [{"close": 1.0}]
+
+        def get_xdxr_info(self, market, code):
+            return []
+
+        def get_finance_info(self, market, code):
+            if self.ip == "10.0.0.1":
+                return {"liutongguben": 0.0}
+            return None if code == "002898" else {"liutongguben": 100000000.0}
+
+    monkeypatch.setattr("src.fetcher.TdxHq_API", ProbeFinApi)
+    pool = TdxConnectionPool(servers=servers)
+    probe_res = pool.probe_and_filter_servers(timeout=1.0, max_active=2)
+    assert [r["server"][2] for r in probe_res["blocked"]] == ["bad_fin"]
+    assert probe_res["blocked"][0]["reason"] == "finance_invalid"
+    assert [s[2] for s in pool.servers] == ["good_fin"]
+
+    # fetch_finance_info 对特例股返回 None 时不应记录服务端故障
+    fetcher = TdxFetcher(pool=pool)
+    assert fetcher.fetch_finance_info("SZ002898") is None
+    assert pool._fail_counts == {}
+    pool.disconnect_thread()
+
+    # 3. _compute_turn10_array 非有限值防御与 DailyUpdater xdxr 二级兜底
+    arr_inf = MultiCycleKDJEngine._compute_turn10_array(
+        np.array([1000.0, np.inf], dtype=np.float64),
+        prev_volumes=None,
+        liutongguben=100_000_000.0,
+    )
+    assert np.isfinite(arr_inf[0]) and np.isnan(arr_inf[1])
+
+    db_file = str(tmp_path / "test_xdxr_fallback_updater.duckdb")
+    con = duckdb.connect(db_file)
+    create_tables(con)
+    con.execute("""
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, board, latest_adj_factor, liutongguben)
+        VALUES ('SZ301139', '301139', '元道通信', 'STOCK', 'SZSE', 'CYB', 1.0, NULL)
+    """)
+    con.execute("""
+        INSERT INTO daily_snapshot (
+            symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor
+        ) VALUES ('SZ301139', '301139', '2026-10-14', 0, 20.0, 21.0, 19.5, 20.5, 1000.0, 20500.0, 1.0)
+    """)
+    con.close()
+
+    d_target = datetime.date(2026, 10, 15)
+    mock_fetcher = MagicMock()
+    mock_fetcher.get_latest_market_dates.return_value = (d_target, d_target, True)
+    mock_fetcher.get_latest_market_status.return_value = (d_target, True)
+    mock_fetcher.fetch_daily_bars.return_value = [{
+        "datetime": "2026-10-15", "open": 20.5, "high": 21.5, "low": 20.0,
+        "close": 21.0, "vol": 200000, "amount": 4200000,
+    }]
+    mock_fetcher.fetch_minute_bars.return_value = []
+    mock_fetcher.fetch_finance_info.return_value = {"liutongguben": 0.0}
+    mock_fetcher.fetch_xdxr_events.return_value = [
+        {"year": 2026, "month": 6, "day": 30, "category": 5, "panhouliutong": 10000.0}
+    ]
+
+    updater = DailyUpdater(db_path=db_file, fetcher=mock_fetcher)
+    res_up = updater.run_update(allow_intraday=False)
+    assert res_up["status"] == "SUCCESS"
+    assert res_up["daily_rows_added"] == 1
+
+    con = duckdb.connect(db_file, read_only=True)
+    ltgb_saved, turn10_saved = con.execute(
+        "SELECT liutongguben, turn10 FROM v_daily_qfq WHERE symbol='SZ301139' AND trade_date='2026-10-15'"
+    ).fetchone()
+    con.close()
+    assert np.isclose(ltgb_saved, 100_000_000.0)
+    # 前1日 1000手 + 本日 2000手 = 3000手 * 10000 / 1e8 = 0.3%
+    assert np.isclose(turn10_saved, 0.3)
+
+    # 4. 测试 populate_liutongguben 三级兜底（v1 turn10 反推）与 backfill_turn10 对 v1 NULL/NaN 自动补算
+    from scripts.add_turn10_and_liutongguben import backfill_turn10, populate_liutongguben
+
+    db_mig = str(tmp_path / "test_tier3_mig.duckdb")
+    v1_mig = str(tmp_path / "test_tier3_v1.duckdb")
+
+    con_m = duckdb.connect(db_mig)
+    create_tables(con_m)
+    con_m.execute("""
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, board, latest_adj_factor, liutongguben)
+        VALUES
+            ('SH601059', '601059', '信达证券', 'STOCK', 'SSE', 'MAIN', 1.0, NULL),
+            ('SH000001', '000001', '上证指数', 'BROAD_INDEX', 'SSE', 'INDEX', 1.0, 999.0)
+    """)
+    con_m.execute("""
+        INSERT INTO daily_snapshot (
+            symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor
+        ) VALUES
+            ('SH601059', '601059', '2026-10-14', 0, 15.0, 15.5, 14.8, 15.2, 1000.0, 15200.0, 1.0),
+            ('SH601059', '601059', '2026-10-15', 1, 15.2, 15.8, 15.0, 15.5, 2000.0, 31000.0, 1.0)
+    """)
+
+    con_v1_m = duckdb.connect(v1_mig)
+    con_v1_m.execute("""
+        CREATE TABLE stock_daily_feature_snapshot (symbol VARCHAR, trade_date TIMESTAMP, turn10 DOUBLE);
+        INSERT INTO stock_daily_feature_snapshot VALUES
+            ('SH601059', TIMESTAMP '2026-10-14 00:00:00', 0.1),
+            ('SH601059', TIMESTAMP '2026-10-15 00:00:00', NULL);
+    """)
+    con_v1_m.close()
+
+    class EmptyTdxFetcher:
+        def refresh_server_pool(self):
+            return {"active": [], "blocked": [], "fallback": False}
+
+        def fetch_finance_info(self, sym):
+            return None
+
+        def fetch_xdxr_events(self, sym):
+            return []
+
+    monkeypatch.setattr("scripts.add_turn10_and_liutongguben.TdxFetcher", EmptyTdxFetcher)
+    total_cnt, upd_cnt = populate_liutongguben(
+        con_m, workers=1, only_missing=True, source_db_path=v1_mig
+    )
+    assert (total_cnt, upd_cnt) == (1, 1)
+
+    inferred_ltgb = con_m.execute("SELECT liutongguben FROM security_info WHERE symbol='SH601059'").fetchone()[0]
+    idx_ltgb = con_m.execute("SELECT liutongguben FROM security_info WHERE symbol='SH000001'").fetchone()[0]
+    assert np.isclose(inferred_ltgb, 100_000_000.0)
+    assert idx_ltgb is None
+
+    # 10-14 对齐 v1 (0.1), 10-15 因 v1.turn10 为 NULL 应由 calc_turn10 自动补算 (1000+2000)*10000/1e8 = 0.3
+    changed = backfill_turn10(con_m, source_db_path=v1_mig, batch_size=500)
+    assert changed == 2
+    t_rows = con_m.execute(
+        "SELECT trade_date, turn10 FROM daily_snapshot WHERE symbol='SH601059' ORDER BY trade_date"
+    ).fetchall()
+    con_m.close()
+    assert np.isclose(t_rows[0][1], 0.1)
+    assert np.isclose(t_rows[1][1], 0.3)
+
+
 
 
 

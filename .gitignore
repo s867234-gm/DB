@@ -38,6 +38,7 @@ logs/
 # Repomix
 repomix-output.*
 repomix-full-codebase.*
+*repomix*.xml
 repomix.config.json
 
 # Environment & IDE

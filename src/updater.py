@@ -26,6 +26,7 @@ from src.fetcher import (
     TdxFetcher,
     calculate_next_adj_factor,
     extract_liutongguben,
+    extract_liutongguben_from_xdxr,
     get_cn_now,
     parse_daily_bars_to_df,
     parse_minute_bars_to_df,
@@ -258,6 +259,7 @@ class DailyUpdater:
         new_corp_actions = []
         adj_by_date: Dict[datetime.date, float] = {}
         adj_factor_changed = False
+        events = None
 
         if sec_type == "STOCK":
             # 判断是否可直接复用当日盘中已算好的复权因子（免去 15:32 盘后重复拉取 5,200+ 次除权接口）
@@ -384,6 +386,12 @@ class DailyUpdater:
         if sec_type == "STOCK" and not df_new_d.empty:
             fin_info = self.fetcher.fetch_finance_info(sym)
             fetched_ltgb = extract_liutongguben(fin_info)
+            if fetched_ltgb is None and db_ltgb is None:
+                if events is not None:
+                    fetched_ltgb = extract_liutongguben_from_xdxr(events)
+                elif fin_info is None or isinstance(fin_info, dict):
+                    events = self.fetcher.fetch_xdxr_events(sym)
+                    fetched_ltgb = extract_liutongguben_from_xdxr(events)
             if fetched_ltgb is not None:
                 if db_ltgb is None or abs(fetched_ltgb - db_ltgb) > 1e-3:
                     liutongguben_changed = True
