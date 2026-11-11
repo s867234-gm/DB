@@ -64,7 +64,7 @@ def verify_database(db_path: str = DEFAULT_DB_PATH):
             count(CASE WHEN sk_1d IS NULL OR isnan(sk_1d) THEN 1 END) as null_sk_1d,
             count(CASE WHEN sk_32d IS NULL OR isnan(sk_32d) THEN 1 END) as null_sk_32d,
             count(CASE WHEN sk_64d IS NULL OR isnan(sk_64d) THEN 1 END) as null_sk_64d,
-            count(CASE WHEN turn10 IS NOT NULL AND (isnan(turn10) OR isinf(turn10) OR turn10 < 0) THEN 1 END) as invalid_turn10
+            count(CASE WHEN turn10 IS NOT NULL AND (isnan(turn10) OR isinf(turn10) OR turn10 < 0 OR (turn10 > 0 AND turn10 < 1e-7)) THEN 1 END) as invalid_turn10
         FROM daily_snapshot
     """).fetchone()
     idx_turn10_cnt = conn.execute("""
@@ -86,9 +86,9 @@ def verify_database(db_path: str = DEFAULT_DB_PATH):
     }
     print(
         f"日线快照 (daily_snapshot): {d_stat[0]:,} 行 | 覆盖标的: {d_stat[1]:,} | 日期: {d_stat[2]} ~ {d_stat[3]} | "
-        f"KDJ空值异常: {d_stat[4] + d_stat[5] + d_stat[6]} | turn10异常(NaN/Inf/<0): {d_stat[7]} | 指数turn10非空: {idx_turn10_cnt}"
+        f"KDJ空值异常: {d_stat[4] + d_stat[5] + d_stat[6]} | turn10异常(NaN/Inf/<0/次正规): {d_stat[7]} | 指数turn10非空: {idx_turn10_cnt}"
     )
-    assert d_stat[7] == 0, f"Error: Found {d_stat[7]} invalid turn10 rows (NaN/Inf/<0)!"
+    assert d_stat[7] == 0, f"Error: Found {d_stat[7]} invalid turn10 rows (NaN/Inf/<0/subnormal)!"
     assert idx_turn10_cnt == 0, f"Error: Found {idx_turn10_cnt} non-STOCK daily rows with non-NULL turn10!"
 
     # 3. minute_snapshot 统计

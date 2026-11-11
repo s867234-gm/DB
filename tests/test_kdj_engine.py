@@ -334,13 +334,32 @@ def test_turn10_calculation_and_incremental_continuity():
     df_inc = pd.concat([df_p1, df_p2], ignore_index=True)
     np.testing.assert_allclose(df_full['turn10'].to_numpy(), df_inc['turn10'].to_numpy(), rtol=1e-12, atol=1e-12)
 
-    # 3. 含 NaN 成交量：窗口命中 NaN 必须为 NaN（严禁填 0），离开 10 根窗口后恢复
+    # 3. 含 NaN / 次正规浮点噪点 / 零成交量：窗口命中任意无效值必须为 NaN（严禁填 0），离开 10 根窗口后恢复
     df_nan = df.copy()
     df_nan.loc[5, 'volume'] = np.nan
     df_nan_out, _ = MultiCycleKDJEngine.compute_daily_snapshot(df_nan, liutongguben=ltgb)
     assert np.isclose(df_nan_out['turn10'].iloc[4], sum(range(1, 6)) * 100.0 * 10000.0 / ltgb)
     assert np.isnan(df_nan_out['turn10'].iloc[5 : 15]).all()
     assert np.isfinite(df_nan_out['turn10'].iloc[15])
+
+    # 3b. 次正规浮点噪点 (如 1e-40 或 5.877e-39) 与零成交量 (0.0) 在当前批及 prev_volumes 中均应拦截为 NaN
+    df_sub = df.copy()
+    df_sub.loc[5, 'volume'] = 1e-40
+    df_sub.loc[6, 'volume'] = 0.0
+    df_sub_out, _ = MultiCycleKDJEngine.compute_daily_snapshot(df_sub, liutongguben=ltgb)
+    assert np.isclose(df_sub_out['turn10'].iloc[4], sum(range(1, 6)) * 100.0 * 10000.0 / ltgb)
+    assert np.isnan(df_sub_out['turn10'].iloc[5 : 16]).all()
+    assert np.isfinite(df_sub_out['turn10'].iloc[16])
+
+    # 3c. prev_volumes 中若携带次正规浮点 (如 5.877e-39)，增量段命中该窗口亦必须输出 NaN
+    df_sub_p2, _ = MultiCycleKDJEngine.compute_daily_snapshot(
+        df.iloc[10:22].copy(),
+        init_states=st_p1,
+        prev_volumes=[100.0] * 8 + [1e-40],
+        liutongguben=ltgb,
+    )
+    assert np.isnan(df_sub_p2['turn10'].iloc[:9]).all()
+    assert np.isfinite(df_sub_p2['turn10'].iloc[9:]).all()
 
     # 4. 无流通股本时全为 NaN
     df_no_ltgb, _ = MultiCycleKDJEngine.compute_daily_snapshot(df, liutongguben=None)

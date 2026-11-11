@@ -202,7 +202,7 @@ def populate_liutongguben(
                         d.bar_seq,
                         d.trade_date,
                         SUM(d.volume) OVER w AS sum_10_vol,
-                        COUNT(d.volume) OVER w AS valid_cnt,
+                        COUNT(CASE WHEN d.volume IS NOT NULL AND NOT isnan(d.volume) AND NOT isinf(d.volume) AND d.volume > 1e-4 THEN 1 END) OVER w AS valid_cnt,
                         COUNT(*) OVER w AS win_cnt
                     FROM daily_snapshot d
                     JOIN tmp_ltgb_missing m ON d.symbol = m.symbol
@@ -329,7 +329,7 @@ def backfill_turn10(
                             d.trade_date,
                             CASE
                                 WHEN s.liutongguben IS NOT NULL AND s.liutongguben > 0
-                                     AND COUNT(d.volume) OVER w = COUNT(*) OVER w
+                                     AND COUNT(CASE WHEN d.volume IS NOT NULL AND NOT isnan(d.volume) AND NOT isinf(d.volume) AND d.volume > 1e-4 THEN 1 END) OVER w = COUNT(*) OVER w
                                 THEN (SUM(d.volume) OVER w * 10000.0) / s.liutongguben
                                 ELSE NULL
                             END AS calc_turn10
@@ -363,7 +363,7 @@ def backfill_turn10(
                         d.trade_date,
                         CASE
                             WHEN s.liutongguben IS NOT NULL AND s.liutongguben > 0
-                                 AND COUNT(d.volume) OVER w = COUNT(*) OVER w
+                                 AND COUNT(CASE WHEN d.volume IS NOT NULL AND NOT isnan(d.volume) AND NOT isinf(d.volume) AND d.volume > 1e-4 THEN 1 END) OVER w = COUNT(*) OVER w
                             THEN (SUM(d.volume) OVER w * 10000.0) / s.liutongguben
                             ELSE NULL
                         END AS new_turn10

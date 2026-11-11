@@ -320,7 +320,7 @@ class MultiCycleKDJEngine:
         liutongguben: Optional[float],
     ) -> np.ndarray:
         """计算 10 日累计换手率 (%): 10日累计成交股数 / 流通股本 = SUM_10(volume_手) * 10000.0 / liutongguben。
-        window 不足 10 根时按实际可用根数累加；若窗口内任一交易日 volume 为 NaN，对应 turn10 置为 NaN（严禁填 0）。
+        window 不足 10 根时按实际可用根数累加；若窗口内任一交易日 volume 非法 (NaN / Inf / <= 1e-4)，对应 turn10 置为 NaN（严禁填 0）。
         """
         n = len(volumes)
         out = np.full(n, np.nan, dtype=np.float64)
@@ -343,6 +343,8 @@ class MultiCycleKDJEngine:
             prefix = np.empty(0, dtype=np.float64)
 
         all_vols = np.concatenate([prefix, volumes.astype(np.float64, copy=False)])
+        # 停牌无量 (<= 0) 或 IEEE-754 次正规浮点噪点 (0 < v <= 1e-4) 统一视为无效，防止脏数据污染 10 日换手窗口
+        all_vols = np.where((~np.isfinite(all_vols)) | (all_vols <= 1e-4), np.nan, all_vols)
         p_len = len(prefix)
         for t in range(n):
             idx = p_len + t

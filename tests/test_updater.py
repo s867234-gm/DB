@@ -90,6 +90,19 @@ def test_parse_and_filter_bars():
     assert df_m.iloc[2]["slot_seq"] == 16
     assert df_m.iloc[2]["bar_end"] == datetime.datetime(2026, 11, 2, 15, 0)
 
+    # 次正规浮点成交量噪点应被归零（日线/分钟线）
+    raw_d_sub = [
+        {"datetime": "2026-11-03", "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "vol": 5.877471754111438e-39, "amount": 5.877471754111438e-39},
+    ]
+    df_d_sub = parse_daily_bars_to_df("SZ000001", raw_d_sub)
+    assert df_d_sub.iloc[0]["volume"] == 0.0
+
+    raw_m_sub = [
+        {"datetime": "2026-11-03 09:45", "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "vol": 5.877471754111438e-39, "amount": 5.877471754111438e-39},
+    ]
+    df_m_sub = parse_minute_bars_to_df("SZ000001", raw_m_sub)
+    assert df_m_sub.iloc[0]["volume"] == 0.0
+
 
 def test_updater_idempotence(tmp_path):
     """测试增量更新的幂等性：连续两次更新同一批数据，行数零增加且状态保持一致"""
@@ -1553,9 +1566,22 @@ def test_extract_liutongguben_from_xdxr_and_fallbacks(tmp_path, monkeypatch):
     t_rows = con_m.execute(
         "SELECT trade_date, turn10 FROM daily_snapshot WHERE symbol='SH601059' ORDER BY trade_date"
     ).fetchall()
-    con_m.close()
     assert np.isclose(t_rows[0][1], 0.1)
     assert np.isclose(t_rows[1][1], 0.3)
+
+    # 10-16 若含次正规浮点 volume 噪点 (5.877e-39) 且历史误写入 turn10，backfill_turn10 应严格洗回 NULL
+    con_m.execute("""
+        INSERT INTO daily_snapshot (
+            symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor, turn10
+        ) VALUES ('SH601059', '601059', '2026-10-16', 2, 15.5, 15.5, 15.5, 15.5, 5.877471754111438e-39, 0.0, 1.0, 3.6813e-43)
+    """)
+    changed_sub = backfill_turn10(con_m, source_db_path=v1_mig, batch_size=500)
+    assert changed_sub == 1
+    sub_t10 = con_m.execute(
+        "SELECT turn10 FROM daily_snapshot WHERE symbol='SH601059' AND trade_date='2026-10-16'"
+    ).fetchone()[0]
+    con_m.close()
+    assert sub_t10 is None
 
 
 

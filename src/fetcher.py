@@ -706,13 +706,16 @@ def parse_daily_bars_to_df(
         t_date = datetime.datetime.strptime(dt_str, "%Y-%m-%d").date()
         if min_trade_date is not None and t_date <= min_trade_date:
             continue
+        vol_val = float(b["vol"]) / vol_divider
+        if 0.0 < vol_val < 1e-4:
+            vol_val = 0.0
         records.append({
             "trade_date": t_date,
             "open": float(b["open"]),
             "high": float(b["high"]),
             "low": float(b["low"]),
             "close": float(b["close"]),
-            "volume": float(b["vol"]) / vol_divider,
+            "volume": vol_val,
             "amount": float(b["amount"]),
         })
 
@@ -769,6 +772,9 @@ def parse_minute_bars_to_df(
 
         bar_end_dt = datetime.datetime.strptime(f"{d_str} {t_str}", "%Y-%m-%d %H:%M:%S")
 
+        vol_val = float(b["vol"]) / vol_divider
+        if 0.0 < vol_val < 1e-4:
+            vol_val = 0.0
         records.append({
             "trading_date": t_date,
             "bar_end": bar_end_dt,
@@ -777,7 +783,7 @@ def parse_minute_bars_to_df(
             "high": float(b["high"]),
             "low": float(b["low"]),
             "close": float(b["close"]),
-            "volume": float(b["vol"]) / vol_divider,
+            "volume": vol_val,
             "amount": float(b["amount"]),
         })
 
