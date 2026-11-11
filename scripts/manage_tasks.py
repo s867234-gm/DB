@@ -93,6 +93,7 @@ def generate_task_xml(
 
     cmd_args = f'/c ""{PYTHON_EXE}" "{RUN_SCRIPT}" {arguments}""'
 
+    # Priority=4 对应 NORMAL_PRIORITY_CLASS，避免后台计划任务被降权节流导致 DuckDB Checkpoint 变慢
     xml = f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -128,7 +129,7 @@ def generate_task_xml(
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
-    <Priority>7</Priority>
+    <Priority>4</Priority>
   </Settings>
   <Actions Context="Author">
     <Exec>

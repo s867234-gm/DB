@@ -398,6 +398,10 @@ class DailyUpdater:
         start_time = time.time()
         logger.info("=== 启动日常增量更新流程 ===")
 
+        # 0. 并发预检通达信节点池，临时屏蔽异常/缺线节点并按延时择优排序
+        if isinstance(self.fetcher, TdxFetcher):
+            self.fetcher.refresh_server_pool()
+
         # 1. 获取最新市场状态 (支持 get_latest_market_dates 与 get_latest_market_status 双向兼容)
         use_market_dates = False
         try:

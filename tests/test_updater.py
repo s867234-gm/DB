@@ -4,6 +4,7 @@ tests/test_updater.py —— 增量更新引擎单元测试与幂等性校验
 """
 
 import datetime
+import time
 from unittest.mock import MagicMock
 
 import duckdb
@@ -12,6 +13,7 @@ import pandas as pd
 import pytest
 
 from src.fetcher import (
+    TdxConnectionPool,
     TdxFetcher,
     calculate_next_adj_factor,
     parse_daily_bars_to_df,
@@ -760,6 +762,116 @@ def test_get_latest_market_dates_before_and_after_1530(monkeypatch):
     assert closed is True
     assert d_d == datetime.date(2026, 10, 16)
     assert m_d == datetime.date(2026, 10, 16)
+
+
+def test_connection_pool_probe_and_filter_servers(monkeypatch):
+    """测试通达信节点池并发预检：屏蔽断连/缺线异常节点、按延时升序择优、Epoch失效重连"""
+    servers = [
+        ("10.0.0.1", 7709, "dead"),
+        ("10.0.0.2", 7709, "no_daily"),
+        ("10.0.0.3", 7709, "no_min15"),
+        ("10.0.0.4", 7709, "slow"),
+        ("10.0.0.5", 7709, "fast"),
+    ]
+
+    class FakeApi:
+        def __init__(self, heartbeat=False):
+            self.ip = None
+            self.client = None
+
+        def connect(self, ip, port, time_out=2.0):
+            if ip == "10.0.0.1":
+                return False
+            self.ip = ip
+            self.client = object()
+            return True
+
+        def disconnect(self):
+            self.client = None
+
+        def get_security_bars(self, category, market, code, start, count):
+            if self.ip == "10.0.0.2" and category == 4:
+                return []
+            if self.ip == "10.0.0.3" and category == 1:
+                return []
+            if self.ip == "10.0.0.4" and category == 4:
+                time.sleep(0.06)
+            return [{"datetime": "2026-11-10", "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0}]
+
+        def get_xdxr_info(self, market, code):
+            return []
+
+    monkeypatch.setattr("src.fetcher.TdxHq_API", FakeApi)
+
+    pool = TdxConnectionPool(servers=servers)
+    res = pool.probe_and_filter_servers(timeout=1.0, max_active=2)
+
+    assert res["fallback"] is False
+    assert len(res["blocked"]) == 3
+    blocked_reasons = {r["server"][2]: r["reason"] for r in res["blocked"]}
+    assert blocked_reasons == {
+        "dead": "connect_fail",
+        "no_daily": "daily_empty",
+        "no_min15": "min15_empty",
+    }
+    # 健康节点按耗时升序排列：fast 排在 slow 之前
+    assert [s[2] for s in pool.servers] == ["fast", "slow"]
+
+    # 验证 get_client() 优先绑定到筛选后的第一台极速节点
+    client1 = pool.get_client()
+    assert client1.ip == "10.0.0.5"
+
+    # 若再次预检且限制 max_active=1 仅保留 10.0.0.4，Epoch 变更应强制释放旧绑定
+    pool2_servers = [("10.0.0.4", 7709, "slow")]
+    pool._all_servers = pool2_servers
+    fetcher = TdxFetcher(pool=pool)
+    res2 = fetcher.refresh_server_pool(timeout=1.0, max_active=1)
+    assert len(res2["active"]) == 1
+    assert [s[2] for s in pool.servers] == ["slow"]
+
+    client2 = pool.get_client()
+    assert client2.ip == "10.0.0.4"
+    pool.disconnect_thread()
+
+
+def test_connection_pool_probe_fallback_when_all_fail(monkeypatch):
+    """测试全部通达信节点异常时安全回退保留全量候选列表，绝不导致连接池为空"""
+    servers = [
+        ("10.0.0.1", 7709, "dead1"),
+        ("10.0.0.2", 7709, "xdxr_bad"),
+    ]
+
+    class AllFailApi:
+        def __init__(self, heartbeat=False):
+            self.ip = None
+            self.client = None
+
+        def connect(self, ip, port, time_out=2.0):
+            if ip == "10.0.0.1":
+                return False
+            self.ip = ip
+            self.client = object()
+            return True
+
+        def disconnect(self):
+            self.client = None
+
+        def get_security_bars(self, category, market, code, start, count):
+            return [{"close": 1.0}]
+
+        def get_xdxr_info(self, market, code):
+            return None
+
+    monkeypatch.setattr("src.fetcher.TdxHq_API", AllFailApi)
+
+    pool = TdxConnectionPool(servers=servers)
+    res = pool.probe_and_filter_servers(timeout=1.0, max_active=8)
+
+    assert res["fallback"] is True
+    assert res["active"] == []
+    assert {r["reason"] for r in res["blocked"]} == {"connect_fail", "xdxr_none"}
+    assert pool.servers == servers
+
 
 
 

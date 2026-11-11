@@ -10,6 +10,7 @@ src/fetcher.py —— 通达信 (TDX) 高可用行情与除权数据采集器
 5. 采集除权除息信息并计算等比前复权因子推进。
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 from datetime import timezone, timedelta
 import logging
@@ -114,8 +115,12 @@ class TdxConnectionPool:
     _rr_lock = threading.Lock()
 
     def __init__(self, servers=None):
-        self.servers = list(servers or BACKUP_SERVERS)
+        self._all_servers: List[Tuple[str, int, str]] = list(servers or BACKUP_SERVERS)
+        self.servers: List[Tuple[str, int, str]] = list(self._all_servers)
         self._local = threading.local()
+        self._pool_epoch = 0
+        self._rr_counter = 0
+        self._rr_lock = threading.Lock()
 
     @classmethod
     def get_instance(cls):
@@ -124,31 +129,160 @@ class TdxConnectionPool:
                 cls._instance = TdxConnectionPool()
             return cls._instance
 
+    def probe_and_filter_servers(
+        self,
+        timeout: float = 1.2,
+        max_active: int = 8,
+    ) -> Dict:
+        """并发预检全部候选节点：验证连通性、日线、双市场 15 分钟线与除权接口，
+        临时屏蔽异常节点并按延时升序优选前 max_active 台主站。
+        """
+        t_start = time.perf_counter()
+        candidates = list(self._all_servers)
+        if not candidates:
+            return {"elapsed": 0.0, "active": [], "blocked": [], "fallback": False}
+
+        def _probe_one(server: Tuple[str, int, str]) -> Dict:
+            ip, port, _ = server
+            t0 = time.perf_counter()
+            api = TdxHq_API(heartbeat=False)
+            try:
+                if not api.connect(ip, port, time_out=timeout):
+                    return {
+                        "server": server,
+                        "ok": False,
+                        "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+                        "reason": "connect_fail",
+                    }
+                d_bars = api.get_security_bars(4, 0, "000001", 0, 1)
+                if not d_bars:
+                    return {
+                        "server": server,
+                        "ok": False,
+                        "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+                        "reason": "daily_empty",
+                    }
+                m_sz = api.get_security_bars(1, 0, "000001", 0, 1)
+                m_sh = api.get_security_bars(1, 1, "600519", 0, 1)
+                if not m_sz or not m_sh:
+                    return {
+                        "server": server,
+                        "ok": False,
+                        "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+                        "reason": "min15_empty",
+                    }
+                xdxr = api.get_xdxr_info(0, "000001")
+                if xdxr is None:
+                    return {
+                        "server": server,
+                        "ok": False,
+                        "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+                        "reason": "xdxr_none",
+                    }
+                return {
+                    "server": server,
+                    "ok": True,
+                    "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+                    "reason": "ok",
+                }
+            except Exception as e:
+                return {
+                    "server": server,
+                    "ok": False,
+                    "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+                    "reason": f"error:{type(e).__name__}",
+                }
+            finally:
+                try:
+                    api.disconnect()
+                except Exception:
+                    pass
+
+        results = []
+        with ThreadPoolExecutor(max_workers=len(candidates)) as executor:
+            futures = {executor.submit(_probe_one, srv): srv for srv in candidates}
+            for fut in as_completed(futures):
+                results.append(fut.result())
+
+        healthy = sorted((r for r in results if r["ok"]), key=lambda r: r["latency_ms"])
+        blocked = sorted((r for r in results if not r["ok"]), key=lambda r: r["latency_ms"])
+
+        fallback = len(healthy) == 0
+        if fallback:
+            selected = []
+            new_servers = list(self._all_servers)
+        else:
+            selected = healthy[:max_active] if (max_active and max_active > 0) else healthy
+            new_servers = [r["server"] for r in selected]
+
+        with self._rr_lock:
+            self.disconnect_thread()
+            self.servers = new_servers
+            self._pool_epoch += 1
+            self._rr_counter = 0
+
+        elapsed = round(time.perf_counter() - t_start, 2)
+        if fallback:
+            logger.warning(
+                f"通达信节点池预检全部失败 ({len(blocked)} 台异常，耗时 {elapsed:.2f}s)，回退保留全量节点重试"
+            )
+        else:
+            active_desc = ", ".join(
+                f"{r['server'][2]}({r['latency_ms']:.0f}ms)" for r in selected
+            )
+            logger.info(
+                f"节点池预检完成 (耗时 {elapsed:.2f}s): 启用 {len(selected)}/{len(candidates)} 台优选节点 -> {active_desc}"
+            )
+            if blocked:
+                blocked_desc = ", ".join(
+                    f"{r['server'][2]}[{r['reason']}]" for r in blocked
+                )
+                logger.info(f"本轮屏蔽 {len(blocked)} 台异常节点: {blocked_desc}")
+
+        return {
+            "elapsed": elapsed,
+            "active": selected,
+            "blocked": blocked,
+            "fallback": fallback,
+        }
+
     def get_client(self) -> TdxHq_API:
         """获取当前线程绑定的可用 TdxHq_API 实例，失败时自动故障切换"""
         if hasattr(self._local, "api") and self._local.api is not None:
-            # 简单心跳验证
-            try:
-                if self._local.api.client is not None:
-                    return self._local.api
-            except Exception:
-                pass
+            if getattr(self._local, "epoch", -1) != self._pool_epoch:
+                self.disconnect_thread()
+            else:
+                # 简单心跳验证
+                try:
+                    if self._local.api.client is not None:
+                        return self._local.api
+                except Exception:
+                    pass
 
-        # 重新建立连接，通过轮询偏移均匀分散不同工作线程到多台券商主站
+        # 重新建立连接，通过轮询偏移均匀分散不同工作线程到多台优选券商主站
         with self._rr_lock:
-            start_idx = self._rr_counter % len(self.servers)
-            TdxConnectionPool._rr_counter += 1
+            servers_snapshot = list(self.servers)
+            epoch_snapshot = self._pool_epoch
+            start_idx = self._rr_counter % len(servers_snapshot)
+            self._rr_counter += 1
 
-        ordered_servers = self.servers[start_idx:] + self.servers[:start_idx]
+        ordered_servers = servers_snapshot[start_idx:] + servers_snapshot[:start_idx]
         api = TdxHq_API(heartbeat=False)
         for ip, port, name in ordered_servers:
             try:
                 if api.connect(ip, port, time_out=2.0):
-                    # 快速验证是否能取到有效测试 K 线数据（过滤假死和空回包节点）
-                    test = api.get_security_bars(4, 0, "000001", 0, 1)
-                    if test is not None and len(test) > 0:
+                    # 快速验证是否能取到有效日线与 15 分钟线 K 线数据（过滤假死、单线缺失与空回包节点）
+                    test_d = api.get_security_bars(4, 0, "000001", 0, 1)
+                    test_m = api.get_security_bars(1, 0, "000001", 0, 1)
+                    if (
+                        test_d is not None
+                        and len(test_d) > 0
+                        and test_m is not None
+                        and len(test_m) > 0
+                    ):
                         self._local.api = api
                         self._local.server = (ip, port, name)
+                        self._local.epoch = epoch_snapshot
                         return api
                 api.disconnect()
             except Exception:
@@ -173,6 +307,10 @@ class TdxFetcher:
 
     def __init__(self, pool: Optional[TdxConnectionPool] = None):
         self.pool = pool or TdxConnectionPool.get_instance()
+
+    def refresh_server_pool(self, timeout: float = 1.2, max_active: int = 8) -> Dict:
+        """并发预检通达信节点池，临时屏蔽异常节点并按延时择优排序"""
+        return self.pool.probe_and_filter_servers(timeout=timeout, max_active=max_active)
 
     def get_latest_market_dates(
         self, allow_intraday: bool = False
