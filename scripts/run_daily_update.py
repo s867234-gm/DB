@@ -165,6 +165,9 @@ def main():
         logger.info(f"  分钟追加: {result.get('minute_rows_added', 0):,} 行")
         logger.info(f"  总计耗时: {result.get('elapsed_seconds', 0)} 秒")
         logger.info("==================================================")
+    except Exception as e:
+        logger.exception(f"增量更新发生未捕获异常: {e}")
+        sys.exit(1)
     finally:
         lock.release()
 

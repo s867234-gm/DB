@@ -222,7 +222,7 @@ class DailyUpdater:
         daily_offset = min(max(days_gap_d + 10, 15), 800)
 
         if last_m is not None and last_m == target_date:
-            minute_offset = min(max((16 - last_m_slot) + 4, 8), 48)
+            minute_offset = min(max(16 - last_m_slot + 2, 4), 16)
         else:
             days_gap_m = (target_date - last_m).days if (last_m and target_date) else 10
             minute_offset = min(max((days_gap_m + 3) * 16, 48), 800)
@@ -257,8 +257,19 @@ class DailyUpdater:
         adj_factor_changed = False
 
         if sec_type == "STOCK":
+            # 判断是否可直接复用当日盘中已算好的复权因子（免去 15:32 盘后重复拉取 5,200+ 次除权接口）
+            reuse_intraday_adj = (
+                not df_new_d.empty
+                and len(df_new_d) == 1
+                and df_new_d.iloc[0]["trade_date"] == target_date
+                and last_m is not None
+                and last_m == target_date
+                and last_m_adj is not None
+                and not pd.isna(last_m_adj)
+            )
+
             # 判断是否需要拉取除权事件：
-            # 1) 日线有新数据推进
+            # 1) 日线有新数据推进且不能复用今日盘中因子
             # 2) 盘中模式 (allow_intraday=True) 且 分钟目标日大于日线目标日 (target_date > daily_target_date) 且有分钟线
             #    且仅限当日首次入库分钟线 (last_m is None or last_m < target_date)
             has_intraday_preview = (
@@ -269,7 +280,15 @@ class DailyUpdater:
                 and (last_m is None or last_m < target_date)
             )
 
-            if not df_new_d.empty or has_intraday_preview:
+            if reuse_intraday_adj:
+                base_daily_adj = curr_adj
+                curr_adj = float(last_m_adj)
+                df_new_d["adj_factor"] = curr_adj
+                if abs(curr_adj - base_daily_adj) > 1e-6:
+                    adj_factor_changed = True
+                if not df_new_m.empty:
+                    df_new_m["adj_factor"] = curr_adj
+            elif not df_new_d.empty or has_intraday_preview:
                 events = self.fetcher.fetch_xdxr_events(sym)
                 event_by_date = {}
                 for e in events:
@@ -374,9 +393,17 @@ class DailyUpdater:
                 df_new_m, cutoff_date=None, init_states=minute_states
             )
 
-        # 7. 序列化更新后的增量状态
-        all_updated_states = list(daily_states.values()) + list(minute_states.values())
-        df_state = states_to_df(all_updated_states, updated_at=get_cn_now())
+        # 7. 按需序列化已发生数据推进的周期增量状态（未推进的周期绝不冗余重写）
+        all_updated_states = []
+        if not df_new_d.empty:
+            all_updated_states.extend(daily_states.values())
+        if not df_new_m.empty:
+            all_updated_states.extend(minute_states.values())
+        df_state = (
+            states_to_df(all_updated_states, updated_at=get_cn_now())
+            if all_updated_states
+            else pd.DataFrame()
+        )
 
         return {
             "symbol": sym,
@@ -388,6 +415,112 @@ class DailyUpdater:
             "corp_actions": new_corp_actions,
         }
 
+    def _flush_results_to_db(
+        self,
+        batch_results: List[Dict],
+        do_checkpoint: bool = True,
+    ) -> Tuple[int, int, int]:
+        """将内存中聚合完成的更新结果在一个原子事务内集中写入 DuckDB。"""
+        if not batch_results:
+            if do_checkpoint:
+                con_chk = self._connect_rw()
+                try:
+                    con_chk.execute("CHECKPOINT;")
+                finally:
+                    con_chk.close()
+            return 0, 0, 0
+
+        d_list = [r["daily_snap"] for r in batch_results if not r["daily_snap"].empty]
+        m_list = [r["minute_snap"] for r in batch_results if not r["minute_snap"].empty]
+        s_list = [r["state_df"] for r in batch_results if not r["state_df"].empty]
+        ca_list = []
+        for r in batch_results:
+            if r.get("corp_actions"):
+                ca_list.extend(r["corp_actions"])
+
+        b_df_d = pd.concat(d_list, ignore_index=True) if d_list else pd.DataFrame()
+        b_df_m = pd.concat(m_list, ignore_index=True) if m_list else pd.DataFrame()
+        b_df_s = pd.concat(s_list, ignore_index=True) if s_list else pd.DataFrame()
+        b_df_ca = (
+            pd.DataFrame(ca_list).drop_duplicates(
+                subset=["symbol", "event_date", "category"], keep="last"
+            )
+            if ca_list
+            else pd.DataFrame()
+        )
+
+        sym_cnt = len(batch_results)
+        added_d = len(b_df_d)
+        added_m = len(b_df_m)
+
+        con = self._connect_rw()
+        try:
+            con.execute("PRAGMA threads=8;")
+            con.execute("BEGIN TRANSACTION;")
+
+            if not b_df_d.empty:
+                con.register("tmp_batch_daily", b_df_d)
+                con.execute(
+                    "INSERT OR IGNORE INTO daily_snapshot BY NAME SELECT * FROM tmp_batch_daily"
+                )
+                con.unregister("tmp_batch_daily")
+
+            if not b_df_m.empty:
+                con.register("tmp_batch_minute", b_df_m)
+                con.execute(
+                    "INSERT OR IGNORE INTO minute_snapshot BY NAME SELECT * FROM tmp_batch_minute"
+                )
+                con.unregister("tmp_batch_minute")
+
+            if not b_df_s.empty:
+                con.register("tmp_batch_state", b_df_s)
+                con.execute(
+                    "INSERT OR REPLACE INTO incremental_state BY NAME SELECT * FROM tmp_batch_state"
+                )
+                con.unregister("tmp_batch_state")
+
+            if not b_df_ca.empty:
+                con.register("tmp_batch_ca", b_df_ca)
+                con.execute(
+                    "INSERT OR IGNORE INTO corporate_action BY NAME SELECT * FROM tmp_batch_ca"
+                )
+                con.unregister("tmp_batch_ca")
+
+            adj_updates = [
+                {"symbol": r["symbol"], "latest_adj_factor": r["latest_adj_factor"]}
+                for r in batch_results
+                if not r["daily_snap"].empty or r.get("adj_factor_changed")
+            ]
+            if adj_updates:
+                df_adj_upd = pd.DataFrame(adj_updates).drop_duplicates(
+                    subset=["symbol"], keep="last"
+                )
+                con.register("tmp_batch_adj", df_adj_upd)
+                con.execute("""
+                    UPDATE security_info s
+                    SET latest_adj_factor = u.latest_adj_factor, updated_at = NOW()
+                    FROM tmp_batch_adj u
+                    WHERE s.symbol = u.symbol
+                """)
+                con.unregister("tmp_batch_adj")
+
+            con.execute("COMMIT;")
+            if do_checkpoint:
+                con.execute("CHECKPOINT;")
+        except Exception as e:
+            try:
+                con.execute("ROLLBACK;")
+            except Exception:
+                pass
+            logger.error(f"批量写入事务回滚: {e}")
+            raise
+        finally:
+            con.close()
+
+        del b_df_d, b_df_m, b_df_s, b_df_ca
+        gc.collect()
+        return sym_cnt, added_d, added_m
+
     def run_update(
         self,
         allow_intraday: bool = False,
@@ -395,14 +528,17 @@ class DailyUpdater:
         batch_size: int = 500,
     ) -> Dict:
         """执行日常增量更新主流程。"""
-        start_time = time.time()
+        total_start = time.perf_counter()
         logger.info("=== 启动日常增量更新流程 ===")
 
-        # 0. 并发预检通达信节点池，临时屏蔽异常/缺线节点并按延时择优排序
+        # 0. 并发预检通达信节点池，临时屏蔽异常/缺线节点并按 /24 子网配额与延时择优排序
+        t_prescan_start = time.perf_counter()
         if isinstance(self.fetcher, TdxFetcher):
             self.fetcher.refresh_server_pool()
+        t_prescan = round(time.perf_counter() - t_prescan_start, 2)
 
         # 1. 获取最新市场状态 (支持 get_latest_market_dates 与 get_latest_market_status 双向兼容)
+        t_plan_start = time.perf_counter()
         use_market_dates = False
         try:
             res_dates = self.fetcher.get_latest_market_dates(allow_intraday)
@@ -432,158 +568,132 @@ class DailyUpdater:
 
         total_tasks = len(tasks)
         if total_tasks == 0:
-            logger.info("全市场标的均已是最新状态，无需更新！")
+            t_plan_state = round(time.perf_counter() - t_plan_start, 2)
+            elapsed = round(time.perf_counter() - total_start, 2)
+            logger.info(
+                f"全市场标的均已是最新状态，无需更新！[预检={t_prescan:.2f}s | 计划检查={t_plan_state:.2f}s | 总耗时={elapsed:.2f}s]"
+            )
             return {
                 "status": "SKIPPED_ALREADY_UP_TO_DATE",
                 "target_date": minute_target_date,
                 "symbols_updated": 0,
-                "elapsed_seconds": round(time.time() - start_time, 2),
+                "elapsed_seconds": elapsed,
             }
 
-        logger.info(f"本次共有 {total_tasks} 只标的需要更新")
+        # 单次前置读取本轮全部所需标的的按需 incremental_state（消除循环内多次连接开关）
+        any_needs_daily = any(t["needs_daily"] for t in tasks)
+        any_needs_minute = any(t["needs_minute"] for t in tasks)
+        if any_needs_daily and any_needs_minute:
+            target_periods = list(DAILY_PERIOD_NAMES) + list(MINUTE_PERIOD_NAMES)
+        elif any_needs_daily:
+            target_periods = list(DAILY_PERIOD_NAMES)
+        elif any_needs_minute:
+            target_periods = list(MINUTE_PERIOD_NAMES)
+        else:
+            target_periods = []
 
-        # 3. 多线程处理与分批写入 (外层复用固定线程池)
+        states_by_sym: Dict[str, Dict[str, PeriodState]] = {}
+        if target_periods:
+            all_symbols = [t["symbol"] for t in tasks]
+            period_sql = ", ".join(f"'{p}'" for p in target_periods)
+            con_st = duckdb.connect(self.db_path, read_only=True)
+            try:
+                con_st.register("tmp_all_syms", pd.DataFrame({"symbol": all_symbols}))
+                st_rows = con_st.execute(f"""
+                    SELECT s.symbol, s.period, s.last_closed_bucket_id, s.closed_highs_adj, s.closed_lows_adj,
+                           s.sk_closed, s.sd_closed, s.mk_closed, s.md_closed, s.last_valid_rsv13, s.last_valid_rsv104,
+                           s.bar_count, s.high_adj, s.low_adj, s.updated_at
+                    FROM incremental_state s
+                    JOIN tmp_all_syms b ON s.symbol = b.symbol
+                    WHERE s.period IN ({period_sql})
+                """).fetchall()
+                con_st.unregister("tmp_all_syms")
+            finally:
+                con_st.close()
+
+            for r in st_rows:
+                st_obj = PeriodState.from_db_row(r)
+                states_by_sym.setdefault(st_obj.symbol, {})[st_obj.period] = st_obj
+
+        for t in tasks:
+            t["states_dict"] = states_by_sym.get(t["symbol"], {})
+
+        t_plan_state = round(time.perf_counter() - t_plan_start, 2)
+        logger.info(
+            f"本次共有 {total_tasks} 只标的需要更新 (前置按需读取状态 {len(target_periods)} 周期, 耗时 {t_plan_state:.2f}s)"
+        )
+
+        # 3. 全量连续流式线程池拉取与 KDJ 计算（消除 500 标的同步屏障等待）
+        flush_threshold = max(batch_size * 12, 6000)
+        buffered_results: List[Dict] = []
         total_d_rows = 0
         total_m_rows = 0
         updated_symbols = 0
+        completed_tasks = 0
+        buffered_d_rows = 0
+        buffered_m_rows = 0
+        write_seconds_acc = 0.0
 
+        t_compute_start = time.perf_counter()
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            for batch_idx in range(0, total_tasks, batch_size):
-                batch_tasks = tasks[batch_idx : batch_idx + batch_size]
-                batch_results = []
-
-                # 主线程预先单 SQL 批量读取该批次全部 symbol 的 incremental_state
-                batch_symbols = [t["symbol"] for t in batch_tasks]
-                con_st = duckdb.connect(self.db_path, read_only=True)
+            futures = {
+                executor.submit(self.process_symbol, t, minute_target_date): t
+                for t in tasks
+            }
+            for fut in as_completed(futures):
+                completed_tasks += 1
                 try:
-                    con_st.register("tmp_batch_syms", pd.DataFrame({"symbol": batch_symbols}))
-                    st_rows = con_st.execute("""
-                        SELECT s.symbol, s.period, s.last_closed_bucket_id, s.closed_highs_adj, s.closed_lows_adj,
-                               s.sk_closed, s.sd_closed, s.mk_closed, s.md_closed, s.last_valid_rsv13, s.last_valid_rsv104,
-                               s.bar_count, s.high_adj, s.low_adj, s.updated_at
-                        FROM incremental_state s
-                        JOIN tmp_batch_syms b ON s.symbol = b.symbol
-                    """).fetchall()
-                    con_st.unregister("tmp_batch_syms")
-                finally:
-                    con_st.close()
-
-                states_by_sym = {}
-                for r in st_rows:
-                    st_obj = PeriodState.from_db_row(r)
-                    states_by_sym.setdefault(st_obj.symbol, {})[st_obj.period] = st_obj
-
-                for t in batch_tasks:
-                    t["states_dict"] = states_by_sym.get(t["symbol"], {})
-
-                futures = {
-                    executor.submit(self.process_symbol, t, minute_target_date): t
-                    for t in batch_tasks
-                }
-                for fut in as_completed(futures):
-                    try:
-                        res = fut.result()
-                        if res is not None:
-                            batch_results.append(res)
-                    except Exception as e:
-                        t = futures[fut]
-                        logger.error(f"{t['symbol']} 处理异常: {e}")
-
-                if not batch_results:
-                    continue
-
-                # 聚合本批次数据
-                d_list = [r["daily_snap"] for r in batch_results if not r["daily_snap"].empty]
-                m_list = [r["minute_snap"] for r in batch_results if not r["minute_snap"].empty]
-                s_list = [r["state_df"] for r in batch_results if not r["state_df"].empty]
-                ca_list = []
-                for r in batch_results:
-                    if r.get("corp_actions"):
-                        ca_list.extend(r["corp_actions"])
-
-                b_df_d = pd.concat(d_list, ignore_index=True) if d_list else pd.DataFrame()
-                b_df_m = pd.concat(m_list, ignore_index=True) if m_list else pd.DataFrame()
-                b_df_s = pd.concat(s_list, ignore_index=True) if s_list else pd.DataFrame()
-                b_df_ca = pd.DataFrame(ca_list).drop_duplicates(subset=["symbol", "event_date", "category"], keep="last") if ca_list else pd.DataFrame()
-
-                # 写入 DuckDB (原子事务 + BY NAME)
-                con = self._connect_rw()
-                try:
-                    con.execute("PRAGMA threads=8;")
-                    con.execute("BEGIN TRANSACTION;")
-
-                    if not b_df_d.empty:
-                        con.register("tmp_batch_daily", b_df_d)
-                        con.execute(
-                            "INSERT OR IGNORE INTO daily_snapshot BY NAME SELECT * FROM tmp_batch_daily"
-                        )
-                        con.unregister("tmp_batch_daily")
-                        total_d_rows += len(b_df_d)
-
-                    if not b_df_m.empty:
-                        con.register("tmp_batch_minute", b_df_m)
-                        con.execute(
-                            "INSERT OR IGNORE INTO minute_snapshot BY NAME SELECT * FROM tmp_batch_minute"
-                        )
-                        con.unregister("tmp_batch_minute")
-                        total_m_rows += len(b_df_m)
-
-                    if not b_df_s.empty:
-                        con.register("tmp_batch_state", b_df_s)
-                        con.execute(
-                            "INSERT OR REPLACE INTO incremental_state BY NAME SELECT * FROM tmp_batch_state"
-                        )
-                        con.unregister("tmp_batch_state")
-
-                    if not b_df_ca.empty:
-                        con.register("tmp_batch_ca", b_df_ca)
-                        con.execute(
-                            "INSERT OR IGNORE INTO corporate_action BY NAME SELECT * FROM tmp_batch_ca"
-                        )
-                        con.unregister("tmp_batch_ca")
-
-                    # 批量单条 SQL 更新 security_info 的 latest_adj_factor 与 updated_at
-                    adj_updates = [
-                        {"symbol": r["symbol"], "latest_adj_factor": r["latest_adj_factor"]}
-                        for r in batch_results
-                        if not r["daily_snap"].empty or r.get("adj_factor_changed")
-                    ]
-                    if adj_updates:
-                        df_adj_upd = pd.DataFrame(adj_updates).drop_duplicates(subset=["symbol"], keep="last")
-                        con.register("tmp_batch_adj", df_adj_upd)
-                        con.execute("""
-                            UPDATE security_info s
-                            SET latest_adj_factor = u.latest_adj_factor, updated_at = NOW()
-                            FROM tmp_batch_adj u
-                            WHERE s.symbol = u.symbol
-                        """)
-                        con.unregister("tmp_batch_adj")
-
-                    con.execute("COMMIT;")
-                    updated_symbols += len(batch_results)
-                    del b_df_d, b_df_m, b_df_s, batch_results
-                    gc.collect()
-
-                    logger.info(
-                        f"进度: 已更新 {updated_symbols}/{total_tasks} 标的 | 累积追加日线 {total_d_rows:,} 条, 分钟线 {total_m_rows:,} 条"
-                    )
+                    res = fut.result()
+                    if res is not None:
+                        buffered_results.append(res)
+                        buffered_d_rows += len(res["daily_snap"])
+                        buffered_m_rows += len(res["minute_snap"])
                 except Exception as e:
-                    con.execute("ROLLBACK;")
-                    logger.error(f"批量写入事务回滚: {e}")
-                    raise
-                finally:
-                    con.close()
+                    t = futures[fut]
+                    logger.error(f"{t['symbol']} 处理异常: {e}")
 
-        # 全部批次完成后触发 CHECKPOINT 保证 WAL 日志落盘
-        con_chk = self._connect_rw()
-        try:
-            con_chk.execute("CHECKPOINT;")
-        finally:
-            con_chk.close()
+                if batch_size > 0 and completed_tasks % batch_size == 0:
+                    logger.info(
+                        f"流式进度: 已处理 {completed_tasks}/{total_tasks} 标的 | 有效更新 {updated_symbols + len(buffered_results)} 只 (日线 {total_d_rows + buffered_d_rows:,} 条, 分钟线 {total_m_rows + buffered_m_rows:,} 条)"
+                    )
 
-        elapsed = round(time.time() - start_time, 2)
+                if len(buffered_results) >= flush_threshold:
+                    tw0 = time.perf_counter()
+                    cnt, add_d, add_m = self._flush_results_to_db(
+                        buffered_results, do_checkpoint=False
+                    )
+                    write_seconds_acc += time.perf_counter() - tw0
+                    updated_symbols += cnt
+                    total_d_rows += add_d
+                    total_m_rows += add_m
+                    buffered_results.clear()
+                    buffered_d_rows = 0
+                    buffered_m_rows = 0
+
+        t_compute = max(
+            0.0, round((time.perf_counter() - t_compute_start) - write_seconds_acc, 2)
+        )
+
+        # 4. 集中原子事务写库并执行唯一一次 CHECKPOINT
+        if buffered_results or updated_symbols > 0:
+            tw0 = time.perf_counter()
+            cnt, add_d, add_m = self._flush_results_to_db(
+                buffered_results, do_checkpoint=True
+            )
+            write_seconds_acc += time.perf_counter() - tw0
+            updated_symbols += cnt
+            total_d_rows += add_d
+            total_m_rows += add_m
+            buffered_results.clear()
+
+        t_write = round(write_seconds_acc, 2)
+        elapsed = round(time.perf_counter() - total_start, 2)
         logger.info(
-            f"=== 增量更新完成! 标的数={updated_symbols}, 日线={total_d_rows:,}, 分钟线={total_m_rows:,}, 耗时={elapsed}s ==="
+            f"=== 增量更新完成! 标的数={updated_symbols}, 日线={total_d_rows:,}, 分钟线={total_m_rows:,}, 总耗时={elapsed}s ==="
+        )
+        logger.info(
+            f"阶段耗时拆解: 预检={t_prescan:.2f}s | 计划与状态读取={t_plan_state:.2f}s | "
+            f"网络拉取与KDJ计算={t_compute:.2f}s | DuckDB写入与Checkpoint={t_write:.2f}s | 总耗时={elapsed:.2f}s"
         )
 
         return {

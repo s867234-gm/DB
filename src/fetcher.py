@@ -31,22 +31,22 @@ def get_cn_now() -> datetime.datetime:
     return datetime.datetime.now(CN_TZ).replace(tzinfo=None)
 
 
-# 实测高可用券商自建主站列表（针对深圳电信宽带全面实测选优，跨多家券商与华南极速节点）
+# 实测高可用券商自建主站列表（跨券商多云集群与跨 /24 网段优选，避免单一子网并发限流）
 BACKUP_SERVERS: List[Tuple[str, int, str]] = [
-    ("139.9.90.169", 7709, "国泰君安-深圳华为云"),   # 深圳本地华为云: 延时 33ms, 总耗时 97ms
-    ("39.108.166.99", 7709, "华泰证券-深圳阿里云1"),   # 深圳本地阿里云: 延时 27ms, 总耗时 103ms
-    ("47.106.36.3", 7709, "华泰证券-深圳阿里云2"),     # 深圳本地阿里云: 延时 34ms, 总耗时 116ms
-    ("222.247.45.186", 7709, "方正证券-核心节点"),    # 华南骨干节点: 延时 26ms, 总耗时 166ms
-    ("114.28.173.136", 7709, "国泰君安-广东节点1"),   # 广东电信集群: 延时 50ms, 总耗时 174ms
-    ("114.28.173.130", 7709, "国泰君安-广东节点2"),   # 广东电信集群: 延时 48ms, 总耗时 178ms
-    ("114.28.173.134", 7709, "国泰君安-广东节点3"),   # 广东电信集群: 延时 50ms, 总耗时 180ms
-    ("114.28.173.132", 7709, "国泰君安-广东节点4"),   # 广东电信集群: 延时 51ms, 总耗时 182ms
-    ("114.28.173.137", 7709, "国泰君安-广东节点5"),   # 广东电信集群: 延时 48ms, 总耗时 190ms
-    ("114.28.173.133", 7709, "国泰君安-广东节点6"),   # 广东电信集群: 延时 48ms, 总耗时 193ms
-    ("114.28.173.138", 7709, "国泰君安-广东节点7"),   # 广东电信集群: 延时 48ms, 总耗时 193ms
-    ("114.28.173.139", 7709, "国泰君安-广东节点8"),   # 广东电信集群: 延时 51ms, 总耗时 196ms
-    ("103.251.85.93", 7709, "国泰君安-多线BGP"),      # 华南BGP多线: 延时 49ms, 总耗时 203ms
-    ("114.28.173.140", 7709, "国泰君安-广东节点9"),   # 广东电信集群: 延时 32ms, 总耗时 207ms
+    ("139.9.50.246", 7709, "国泰君安-深圳华为云4"),    # 网段 139.9.50
+    ("139.9.43.31", 7709, "国泰君安-深圳华为云3"),     # 网段 139.9.43
+    ("139.9.90.169", 7709, "国泰君安-深圳华为云1"),    # 网段 139.9.90
+    ("139.9.43.104", 7709, "国泰君安-深圳华为云2"),    # 网段 139.9.43
+    ("222.247.45.186", 7709, "方正证券-核心节点"),     # 网段 222.247.45
+    ("124.232.133.136", 7709, "方正证券-长沙多线"),    # 网段 124.232.133
+    ("103.251.85.93", 7709, "国泰君安-多线BGP1"),      # 网段 103.251.85
+    ("103.251.85.94", 7709, "国泰君安-多线BGP2"),      # 网段 103.251.85
+    ("148.70.93.117", 7709, "国泰君安-成都节点1"),     # 网段 148.70.93
+    ("148.70.31.16", 7709, "国泰君安-成都节点2"),      # 网段 148.70.31
+    ("114.28.173.130", 7709, "国泰君安-广东节点1"),    # 网段 114.28.173 (仅保留延时最优前4台)
+    ("114.28.173.138", 7709, "国泰君安-广东节点2"),
+    ("114.28.173.137", 7709, "国泰君安-广东节点3"),
+    ("114.28.173.133", 7709, "国泰君安-广东节点4"),
 ]
 
 # 15分钟线标准槽位时间映射 (1 ~ 16)
@@ -121,6 +121,7 @@ class TdxConnectionPool:
         self._pool_epoch = 0
         self._rr_counter = 0
         self._rr_lock = threading.Lock()
+        self._fail_counts: Dict[Tuple[str, int, str], int] = {}
 
     @classmethod
     def get_instance(cls):
@@ -129,13 +130,46 @@ class TdxConnectionPool:
                 cls._instance = TdxConnectionPool()
             return cls._instance
 
+    @staticmethod
+    def _subnet24(ip_addr: str) -> str:
+        parts = ip_addr.split(".")
+        return ".".join(parts[:3]) if len(parts) == 4 else ip_addr
+
+    @staticmethod
+    def _is_test_ip(ip_addr: str) -> bool:
+        return ip_addr.startswith("10.0.0.") or ip_addr.startswith("127.0.")
+
+    def record_server_error(
+        self, server: Optional[Tuple[str, int, str]], reason: str = ""
+    ) -> bool:
+        """累计节点异常/慢响应计数，达到阈值时将其从本轮活跃池中动态熔断剔除。"""
+        if server is None:
+            return False
+        evicted = False
+        remaining = 0
+        cnt = 0
+        with self._rr_lock:
+            cnt = self._fail_counts.get(server, 0) + 1
+            self._fail_counts[server] = cnt
+            if cnt >= 3 and server in self.servers and len(self.servers) > 2:
+                self.servers.remove(server)
+                evicted = True
+                remaining = len(self.servers)
+        if evicted:
+            reason_desc = f", {reason}" if reason else ""
+            logger.info(
+                f"节点故障/慢响应累计达 {cnt} 次{reason_desc}，本轮动态熔断剔除: {server[2]} ({server[0]}:{server[1]})，剩余活跃节点 {remaining} 台"
+            )
+        return evicted
+
     def probe_and_filter_servers(
         self,
         timeout: float = 1.2,
         max_active: int = 8,
+        max_per_subnet: int = 2,
     ) -> Dict:
         """并发预检全部候选节点：验证连通性、日线、双市场 15 分钟线与除权接口，
-        临时屏蔽异常节点并按延时升序优选前 max_active 台主站。
+        临时屏蔽异常节点，并按 /24 子网配额与延时升序优选前 max_active 台主站。
         """
         t_start = time.perf_counter()
         candidates = list(self._all_servers)
@@ -154,6 +188,9 @@ class TdxConnectionPool:
                         "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
                         "reason": "connect_fail",
                     }
+                client_sock = getattr(api, "client", None)
+                if client_sock is not None and hasattr(client_sock, "settimeout"):
+                    client_sock.settimeout(timeout)
                 d_bars = api.get_security_bars(4, 0, "000001", 0, 1)
                 if not d_bars:
                     return {
@@ -212,12 +249,41 @@ class TdxConnectionPool:
             selected = []
             new_servers = list(self._all_servers)
         else:
-            selected = healthy[:max_active] if (max_active and max_active > 0) else healthy
+            apply_subnet_cap = (
+                bool(max_per_subnet and max_per_subnet > 0)
+                and len(candidates) > 6
+                and not all(self._is_test_ip(srv[0]) for srv in candidates)
+            )
+            if not apply_subnet_cap:
+                selected = healthy[:max_active] if (max_active and max_active > 0) else healthy
+            else:
+                selected = []
+                selected_servers = set()
+                subnet_counts: Dict[str, int] = {}
+                limit_n = max_active if (max_active and max_active > 0) else len(healthy)
+                # 第一轮：同 /24 子网最多入选 max_per_subnet 台，保证网段多样性防限流
+                for r in healthy:
+                    if len(selected) >= limit_n:
+                        break
+                    sub = self._subnet24(r["server"][0])
+                    if subnet_counts.get(sub, 0) < max_per_subnet:
+                        selected.append(r)
+                        selected_servers.add(r["server"])
+                        subnet_counts[sub] = subnet_counts.get(sub, 0) + 1
+                # 第二轮：若不同子网节点不足 max_active，则按延时升序从剩余健康节点补齐
+                if len(selected) < limit_n:
+                    for r in healthy:
+                        if len(selected) >= limit_n:
+                            break
+                        if r["server"] not in selected_servers:
+                            selected.append(r)
+                            selected_servers.add(r["server"])
             new_servers = [r["server"] for r in selected]
 
         with self._rr_lock:
             self.disconnect_thread()
             self.servers = new_servers
+            self._fail_counts.clear()
             self._pool_epoch += 1
             self._rr_counter = 0
 
@@ -227,11 +293,12 @@ class TdxConnectionPool:
                 f"通达信节点池预检全部失败 ({len(blocked)} 台异常，耗时 {elapsed:.2f}s)，回退保留全量节点重试"
             )
         else:
+            distinct_subnets = len({self._subnet24(r["server"][0]) for r in selected})
             active_desc = ", ".join(
                 f"{r['server'][2]}({r['latency_ms']:.0f}ms)" for r in selected
             )
             logger.info(
-                f"节点池预检完成 (耗时 {elapsed:.2f}s): 启用 {len(selected)}/{len(candidates)} 台优选节点 -> {active_desc}"
+                f"节点池预检完成 (耗时 {elapsed:.2f}s): 启用 {len(selected)}/{len(candidates)} 台优选节点 (覆盖 {distinct_subnets} 个/24网段) -> {active_desc}"
             )
             if blocked:
                 blocked_desc = ", ".join(
@@ -249,7 +316,11 @@ class TdxConnectionPool:
     def get_client(self) -> TdxHq_API:
         """获取当前线程绑定的可用 TdxHq_API 实例，失败时自动故障切换"""
         if hasattr(self._local, "api") and self._local.api is not None:
-            if getattr(self._local, "epoch", -1) != self._pool_epoch:
+            curr_srv = getattr(self._local, "server", None)
+            if (
+                getattr(self._local, "epoch", -1) != self._pool_epoch
+                or curr_srv not in self.servers
+            ):
                 self.disconnect_thread()
             else:
                 # 简单心跳验证
@@ -269,9 +340,19 @@ class TdxConnectionPool:
         ordered_servers = servers_snapshot[start_idx:] + servers_snapshot[:start_idx]
         api = TdxHq_API(heartbeat=False)
         for ip, port, name in ordered_servers:
+            srv = (ip, port, name)
             try:
                 if api.connect(ip, port, time_out=2.0):
-                    # 快速验证是否能取到有效日线与 15 分钟线 K 线数据（过滤假死、单线缺失与空回包节点）
+                    client_sock = getattr(api, "client", None)
+                    if client_sock is not None and hasattr(client_sock, "settimeout"):
+                        client_sock.settimeout(2.0)
+                    # 已通过并发预检 (_pool_epoch > 0) 时直接绑定返回，免去冗余探测 RPC
+                    if epoch_snapshot > 0:
+                        self._local.api = api
+                        self._local.server = srv
+                        self._local.epoch = epoch_snapshot
+                        return api
+                    # 未预检直连模式 (_pool_epoch == 0) 保留快速探测验证
                     test_d = api.get_security_bars(4, 0, "000001", 0, 1)
                     test_m = api.get_security_bars(1, 0, "000001", 0, 1)
                     if (
@@ -281,15 +362,17 @@ class TdxConnectionPool:
                         and len(test_m) > 0
                     ):
                         self._local.api = api
-                        self._local.server = (ip, port, name)
+                        self._local.server = srv
                         self._local.epoch = epoch_snapshot
                         return api
                 api.disconnect()
-            except Exception:
+                self.record_server_error(srv, "connect_or_probe_fail")
+            except Exception as e:
                 try:
                     api.disconnect()
                 except Exception:
                     pass
+                self.record_server_error(srv, f"connect_exc:{type(e).__name__}")
 
         raise RuntimeError("无法连接任何通达信可用行情服务器，请检查网络！")
 
@@ -300,6 +383,7 @@ class TdxConnectionPool:
             except Exception:
                 pass
             self._local.api = None
+            self._local.server = None
 
 
 class TdxFetcher:
@@ -308,9 +392,18 @@ class TdxFetcher:
     def __init__(self, pool: Optional[TdxConnectionPool] = None):
         self.pool = pool or TdxConnectionPool.get_instance()
 
-    def refresh_server_pool(self, timeout: float = 1.2, max_active: int = 8) -> Dict:
-        """并发预检通达信节点池，临时屏蔽异常节点并按延时择优排序"""
-        return self.pool.probe_and_filter_servers(timeout=timeout, max_active=max_active)
+    def refresh_server_pool(
+        self,
+        timeout: float = 1.2,
+        max_active: int = 8,
+        max_per_subnet: int = 2,
+    ) -> Dict:
+        """并发预检通达信节点池，临时屏蔽异常节点并按 /24 子网配额与延时择优排序"""
+        return self.pool.probe_and_filter_servers(
+            timeout=timeout,
+            max_active=max_active,
+            max_per_subnet=max_per_subnet,
+        )
 
     def get_latest_market_dates(
         self, allow_intraday: bool = False
@@ -382,19 +475,31 @@ class TdxFetcher:
         """
         market, code, is_idx = parse_symbol(symbol)
         for retry in range(2):
+            curr_server = None
             try:
                 api = self.pool.get_client()
+                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
+                t_rpc = time.perf_counter()
                 if is_idx or sec_type in ("BROAD_INDEX", "INDUSTRY_INDEX"):
                     bars = api.get_index_bars(4, market, code, 0, offset)
                 else:
                     bars = api.get_security_bars(4, market, code, 0, offset)
-                if bars is not None and len(bars) > 0:
-                    return bars
-                if not bars and retry == 0:
+                rpc_elapsed = time.perf_counter() - t_rpc
+                if rpc_elapsed > 1.8 and hasattr(self.pool, "record_server_error"):
+                    self.pool.record_server_error(curr_server, f"daily_slow:{rpc_elapsed:.2f}s")
+                if bars is None:
+                    if hasattr(self.pool, "record_server_error"):
+                        self.pool.record_server_error(curr_server, "daily_none")
                     self.pool.disconnect_thread()
-                    continue
-                return bars or []
-            except Exception:
+                    if retry == 0:
+                        continue
+                    return []
+                # 返回空列表 [] 且未抛异常时（如停牌或暂无数据），保持健康连接直接返回
+                return bars
+            except Exception as e:
+                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
+                if hasattr(self.pool, "record_server_error"):
+                    self.pool.record_server_error(curr_server, f"daily_exc:{type(e).__name__}")
                 self.pool.disconnect_thread()
                 if retry == 1:
                     logger.warning(f"{symbol} 拉取日线失败")
@@ -409,19 +514,31 @@ class TdxFetcher:
         """
         market, code, is_idx = parse_symbol(symbol)
         for retry in range(2):
+            curr_server = None
             try:
                 api = self.pool.get_client()
+                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
+                t_rpc = time.perf_counter()
                 if is_idx or sec_type in ("BROAD_INDEX", "INDUSTRY_INDEX"):
                     bars = api.get_index_bars(1, market, code, 0, offset)
                 else:
                     bars = api.get_security_bars(1, market, code, 0, offset)
-                if bars is not None and len(bars) > 0:
-                    return bars
-                if not bars and retry == 0:
+                rpc_elapsed = time.perf_counter() - t_rpc
+                if rpc_elapsed > 1.8 and hasattr(self.pool, "record_server_error"):
+                    self.pool.record_server_error(curr_server, f"min15_slow:{rpc_elapsed:.2f}s")
+                if bars is None:
+                    if hasattr(self.pool, "record_server_error"):
+                        self.pool.record_server_error(curr_server, "min15_none")
                     self.pool.disconnect_thread()
-                    continue
-                return bars or []
-            except Exception:
+                    if retry == 0:
+                        continue
+                    return []
+                # 返回空列表 [] 且未抛异常时（如停牌或暂无数据），保持健康连接直接返回
+                return bars
+            except Exception as e:
+                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
+                if hasattr(self.pool, "record_server_error"):
+                    self.pool.record_server_error(curr_server, f"min15_exc:{type(e).__name__}")
                 self.pool.disconnect_thread()
                 if retry == 1:
                     logger.warning(f"{symbol} 拉取分钟线失败")
@@ -434,14 +551,27 @@ class TdxFetcher:
         if is_idx:
             return []
         for retry in range(2):
+            curr_server = None
             try:
                 api = self.pool.get_client()
+                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
+                t_rpc = time.perf_counter()
                 items = api.get_xdxr_info(market, code)
-                if items is None and retry == 0:
+                rpc_elapsed = time.perf_counter() - t_rpc
+                if rpc_elapsed > 1.8 and hasattr(self.pool, "record_server_error"):
+                    self.pool.record_server_error(curr_server, f"xdxr_slow:{rpc_elapsed:.2f}s")
+                if items is None:
+                    if hasattr(self.pool, "record_server_error"):
+                        self.pool.record_server_error(curr_server, "xdxr_none")
                     self.pool.disconnect_thread()
-                    continue
-                return items or []
+                    if retry == 0:
+                        continue
+                    return []
+                return items
             except Exception as e:
+                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
+                if hasattr(self.pool, "record_server_error"):
+                    self.pool.record_server_error(curr_server, f"xdxr_exc:{type(e).__name__}")
                 self.pool.disconnect_thread()
                 if retry == 1:
                     logger.warning(f"{symbol} 拉取除权除息失败: {e}")

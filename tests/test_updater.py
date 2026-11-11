@@ -873,6 +873,247 @@ def test_connection_pool_probe_fallback_when_all_fail(monkeypatch):
     assert pool.servers == servers
 
 
+def test_on_demand_incremental_state_and_postmarket_xdxr_reuse(tmp_path, monkeypatch):
+    """测试按需状态读写隔离（盘中仅写分钟状态/盘后仅写日线状态）与盘后免重复拉取除权接口复用 last_m_adj"""
+    db_file = str(tmp_path / "test_on_demand_state.duckdb")
+    con = duckdb.connect(db_file)
+    create_tables(con)
+    con.execute("""
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, board, latest_adj_factor)
+        VALUES ('SZ000001', '000001', '平安银行', 'STOCK', 'SZSE', 'MAIN', 1.0)
+    """)
+    dates = pd.date_range("2026-10-01", "2026-10-15", freq="B").date
+    init_d = [{
+        "symbol": "SZ000001", "code": "000001", "trade_date": d, "bar_seq": i,
+        "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.0,
+        "volume": 1000.0, "amount": 10000.0, "adj_factor": 1.0,
+    } for i, d in enumerate(dates)]
+    df_init_d_snap, d_states = MultiCycleKDJEngine.compute_daily_snapshot(pd.DataFrame(init_d))
+    con.register("tmp_d", df_init_d_snap)
+    con.execute("INSERT INTO daily_snapshot BY NAME SELECT * FROM tmp_d")
+
+    sentinel_ts = datetime.datetime(2026, 10, 15, 15, 35, 0)
+    m_states_init = [PeriodState.initial("SZ000001", p) for p in MINUTE_PERIOD_NAMES]
+    df_all_init_states = states_to_df(list(d_states.values()) + m_states_init, updated_at=sentinel_ts)
+    con.register("tmp_s", df_all_init_states)
+    con.execute("INSERT INTO incremental_state BY NAME SELECT * FROM tmp_s")
+    con.close()
+
+    # 2026-10-16 分红除权事件: 每10股派5元 (基准收 10.0 -> 9.5, 新因子 10/9.5)
+    expected_adj = 1.0 * (10.0 / 9.5)
+    event_div = [
+        {"year": 2026, "month": 10, "day": 16, "category": 1, "fenhong": 5.0, "songzhuangu": 0.0, "peigu": 0.0, "peigujia": 0.0}
+    ]
+    time_slots = [
+        ("09:45", 9.5, 9.6, 9.4, 9.5), ("10:00", 9.5, 9.7, 9.5, 9.6),
+        ("10:15", 9.6, 9.8, 9.5, 9.7), ("10:30", 9.7, 9.8, 9.6, 9.7),
+        ("10:45", 9.7, 9.9, 9.6, 9.8), ("11:00", 9.8, 9.9, 9.7, 9.8),
+        ("11:15", 9.8, 10.0, 9.8, 9.9), ("11:30", 9.9, 10.0, 9.8, 9.9),
+        ("13:15", 9.9, 10.1, 9.8, 10.0), ("13:30", 10.0, 10.1, 9.9, 10.0),
+        ("13:45", 10.0, 10.2, 9.9, 10.1), ("14:00", 10.1, 10.2, 10.0, 10.1),
+        ("14:15", 10.1, 10.3, 10.0, 10.2), ("14:30", 10.2, 10.3, 10.1, 10.2),
+        ("14:45", 10.2, 10.4, 10.1, 10.3), ("15:00", 10.3, 10.5, 10.2, 10.4),
+    ]
+    all_16_bars = [
+        {"datetime": f"2026-10-16 {t}", "open": o, "high": h, "low": l, "close": c, "vol": 10000, "amount": 100000}
+        for t, o, h, l, c in time_slots
+    ]
+
+    mock_fetcher = MagicMock()
+    mock_fetcher.fetch_xdxr_events.return_value = event_div
+    mock_fetcher.fetch_daily_bars.return_value = [
+        {"datetime": "2026-10-15", "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.0, "vol": 1000, "amount": 10000},
+        {"datetime": "2026-10-16", "open": 9.5, "high": 10.5, "low": 9.4, "close": 10.4, "vol": 160000, "amount": 1600000},
+    ]
+
+    updater = DailyUpdater(db_path=db_file, fetcher=mock_fetcher)
+    captured_periods = []
+    orig_process = updater.process_symbol
+
+    def wrapped_process(task, td):
+        res = orig_process(task, td)
+        if res is not None and not res["state_df"].empty:
+            captured_periods.append(set(res["state_df"]["period"].tolist()))
+        return res
+
+    monkeypatch.setattr(updater, "process_symbol", wrapped_process)
+
+    # 1. 盘中更新（仅分钟线：Slot 1~16 在 15:05 走完，但日线未收盘）
+    intra_ts = datetime.datetime(2026, 10, 16, 15, 5, 0)
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: intra_ts)
+    monkeypatch.setattr("src.updater.get_cn_now", lambda: intra_ts)
+    mock_fetcher.get_latest_market_dates.return_value = (
+        datetime.date(2026, 10, 15), datetime.date(2026, 10, 16), False
+    )
+    mock_fetcher.fetch_minute_bars.return_value = all_16_bars
+
+    res_intra = updater.run_update(allow_intraday=True)
+    assert res_intra["status"] == "SUCCESS"
+    assert res_intra["minute_rows_added"] == 16
+    assert mock_fetcher.fetch_xdxr_events.call_count == 1
+    # 断言：盘中仅写回 4 个分钟周期，绝不重写 7 个日线周期
+    assert captured_periods[-1] == set(MINUTE_PERIOD_NAMES)
+
+    con = duckdb.connect(db_file, read_only=True)
+    d_state_ts = con.execute(
+        "SELECT DISTINCT updated_at FROM incremental_state WHERE symbol = 'SZ000001' AND period IN ('1d', '2d', '4d', '8d', '16d', '32d', '64d')"
+    ).fetchall()
+    m_state_ts = con.execute(
+        "SELECT DISTINCT updated_at FROM incremental_state WHERE symbol = 'SZ000001' AND period IN ('15m', '30m', '60m', '120m')"
+    ).fetchall()
+    con.close()
+    assert d_state_ts == [(sentinel_ts,)]
+    assert m_state_ts == [(intra_ts,)]
+
+    # 2. 盘后 15:35 仅日线增量更新（当日 16 根分钟线已入库，应跳过 fetch_xdxr_events 并直接复用 last_m_adj）
+    post_ts = datetime.datetime(2026, 10, 16, 15, 35, 0)
+    monkeypatch.setattr("src.fetcher.get_cn_now", lambda: post_ts)
+    monkeypatch.setattr("src.updater.get_cn_now", lambda: post_ts)
+    mock_fetcher.fetch_xdxr_events.reset_mock()
+    mock_fetcher.get_latest_market_dates.return_value = (
+        datetime.date(2026, 10, 16), datetime.date(2026, 10, 16), True
+    )
+
+    res_post = updater.run_update(allow_intraday=False)
+    assert res_post["status"] == "SUCCESS"
+    assert res_post["daily_rows_added"] == 1
+    assert res_post["minute_rows_added"] == 0
+    # 关键断言：免调 fetch_xdxr_events
+    assert mock_fetcher.fetch_xdxr_events.call_count == 0
+    # 关键断言：仅写回 7 个日线周期
+    assert captured_periods[-1] == set(DAILY_PERIOD_NAMES)
+
+    con = duckdb.connect(db_file, read_only=True)
+    d_adj = con.execute(
+        "SELECT adj_factor FROM daily_snapshot WHERE symbol = 'SZ000001' AND trade_date = '2026-10-16'"
+    ).fetchone()[0]
+    m_state_ts_after = con.execute(
+        "SELECT DISTINCT updated_at FROM incremental_state WHERE symbol = 'SZ000001' AND period IN ('15m', '30m', '60m', '120m')"
+    ).fetchall()
+    con.close()
+    assert abs(d_adj - expected_adj) < 1e-6
+    # 关键断言：分钟周期状态保持 15:05 时间戳未被重写
+    assert m_state_ts_after == [(intra_ts,)]
+
+
+def test_connection_pool_subnet_quota_circuit_breaker_and_empty_bars(monkeypatch):
+    """测试 /24 子网配额去重、运行时连续异常动态熔断剔除、免探测极速重连及停牌空列表不销毁健康连接"""
+    servers = [
+        ("114.28.173.130", 7709, "subA_1"),
+        ("114.28.173.131", 7709, "subA_2"),
+        ("114.28.173.132", 7709, "subA_3"),
+        ("114.28.173.133", 7709, "subA_4"),
+        ("139.9.43.31", 7709, "subB_1"),
+        ("139.9.43.104", 7709, "subB_2"),
+        ("222.247.45.186", 7709, "subC_1"),
+        ("103.251.85.93", 7709, "subD_1"),
+    ]
+    probe_rpc_calls = {"daily": 0, "min15": 0}
+
+    class SubnetMockApi:
+        def __init__(self, heartbeat=False):
+            self.ip = None
+            self.client = None
+
+        def connect(self, ip, port, time_out=2.0):
+            self.ip = ip
+            self.client = object()
+            return True
+
+        def disconnect(self):
+            self.client = None
+
+        def get_security_bars(self, category, market, code, start, count):
+            if category == 4:
+                probe_rpc_calls["daily"] += 1
+                if self.ip.startswith("114.28.173."):
+                    time.sleep(0.005)
+                elif self.ip.startswith("139.9.43."):
+                    time.sleep(0.025)
+                elif self.ip.startswith("222.247.45."):
+                    time.sleep(0.04)
+                else:
+                    time.sleep(0.055)
+            else:
+                probe_rpc_calls["min15"] += 1
+            return [{"datetime": "2026-11-11", "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0}]
+
+        def get_xdxr_info(self, market, code):
+            return []
+
+    monkeypatch.setattr("src.fetcher.TdxHq_API", SubnetMockApi)
+
+    pool = TdxConnectionPool(servers=servers)
+    res = pool.probe_and_filter_servers(timeout=1.0, max_active=6, max_per_subnet=2)
+    assert res["fallback"] is False
+    assert len(pool.servers) == 6
+    # 验证 114.28.173.* 虽然延时最低，但同 /24 子网最多入选 2 台
+    sub_a_count = sum(1 for s in pool.servers if s[0].startswith("114.28.173."))
+    assert sub_a_count == 2
+    assert {s[2] for s in pool.servers} >= {"subB_1", "subB_2", "subC_1", "subD_1"}
+
+    # 验证 _pool_epoch > 0 后 get_client() 不再重复发送探测请求
+    probe_rpc_calls["daily"] = 0
+    probe_rpc_calls["min15"] = 0
+    pool.get_client()
+    assert probe_rpc_calls["daily"] == 0
+    assert probe_rpc_calls["min15"] == 0
+
+    # 验证运行时动态熔断: 连续 3 次异常即从 pool.servers 移除，且至少保留 2 台保底
+    bad_srv = pool.servers[0]
+    assert pool.record_server_error(bad_srv, "timeout") is False
+    assert pool.record_server_error(bad_srv, "timeout") is False
+    assert bad_srv in pool.servers
+    assert pool.record_server_error(bad_srv, "timeout") is True
+    assert bad_srv not in pool.servers
+    assert len(pool.servers) == 5
+
+    # 继续熔断其余节点，验证保底至少剩 2 台
+    for srv in list(pool.servers):
+        for _ in range(3):
+            pool.record_server_error(srv, "timeout")
+    assert len(pool.servers) == 2
+
+    # 重新预检后应清空故障计数并恢复全部优选节点
+    res_reprobe = pool.probe_and_filter_servers(timeout=1.0, max_active=6, max_per_subnet=2)
+    assert len(pool.servers) == 6
+    assert pool._fail_counts == {}
+
+    # 验证停牌空列表 [] 不触发断连重连，而 None 响应触发熔断计数与断连
+    fetcher = TdxFetcher(pool=pool)
+    client = pool.get_client()
+    monkeypatch.setattr(client, "get_security_bars", lambda *args, **kwargs: [])
+    disconnect_calls = {"n": 0}
+    orig_disconnect = pool.disconnect_thread
+
+    def spy_disconnect():
+        disconnect_calls["n"] += 1
+        orig_disconnect()
+
+    monkeypatch.setattr(pool, "disconnect_thread", spy_disconnect)
+    bars_empty = fetcher.fetch_daily_bars("SZ000001", "STOCK", offset=15)
+    assert bars_empty == []
+    assert disconnect_calls["n"] == 0
+
+    # Node 1 返回 None 时应记录故障并断连切换到 Node 2 重试成功
+    monkeypatch.setattr(client, "get_security_bars", lambda *args, **kwargs: None)
+    bars_failover = fetcher.fetch_daily_bars("SZ000001", "STOCK", offset=15)
+    assert len(bars_failover) == 1
+    assert disconnect_calls["n"] == 1
+    assert sum(pool._fail_counts.values()) == 1
+
+    # 若全部节点均返回 None，重试耗尽后返回 [] 并累计两次故障
+    monkeypatch.setattr(SubnetMockApi, "get_security_bars", lambda *args, **kwargs: None)
+    pool.disconnect_thread()
+    disconnect_calls["n"] = 0
+    bars_none = fetcher.fetch_daily_bars("SZ000001", "STOCK", offset=15)
+    assert bars_none == []
+    assert disconnect_calls["n"] == 2
+    assert sum(pool._fail_counts.values()) >= 3
+    pool.disconnect_thread()
+
+
+
 
 
 
