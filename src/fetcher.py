@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 from datetime import timezone, timedelta
 import logging
+import math
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -577,6 +578,55 @@ class TdxFetcher:
                     logger.warning(f"{symbol} 拉取除权除息失败: {e}")
                     return []
         return []
+
+    def fetch_finance_info(self, symbol: str) -> Optional[Dict]:
+        """获取个股财务基本信息（含流通股本 liutongguben，单位：股；非个股返回 None）"""
+        market, code, is_idx = parse_symbol(symbol)
+        if is_idx or not is_stock_symbol(symbol):
+            return None
+        for retry in range(2):
+            curr_server = None
+            try:
+                api = self.pool.get_client()
+                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
+                t_rpc = time.perf_counter()
+                info = api.get_finance_info(market, code)
+                rpc_elapsed = time.perf_counter() - t_rpc
+                if rpc_elapsed > 1.8 and hasattr(self.pool, "record_server_error"):
+                    self.pool.record_server_error(curr_server, f"finance_slow:{rpc_elapsed:.2f}s")
+                if info is None or not isinstance(info, dict):
+                    if hasattr(self.pool, "record_server_error"):
+                        self.pool.record_server_error(curr_server, "finance_none")
+                    self.pool.disconnect_thread()
+                    if retry == 0:
+                        continue
+                    return None
+                return info
+            except Exception as e:
+                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
+                if hasattr(self.pool, "record_server_error"):
+                    self.pool.record_server_error(curr_server, f"finance_exc:{type(e).__name__}")
+                self.pool.disconnect_thread()
+                if retry == 1:
+                    logger.warning(f"{symbol} 拉取财务信息失败: {e}")
+                    return None
+        return None
+
+
+def extract_liutongguben(info: Optional[Dict]) -> Optional[float]:
+    """从 pytdx.get_finance_info 结果中安全提取有效流通股本（单位：股）；无效或 <=0 返回 None。"""
+    if not isinstance(info, dict):
+        return None
+    val = info.get("liutongguben")
+    if val is None:
+        return None
+    try:
+        fval = float(val)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(fval) or fval <= 0.0:
+        return None
+    return fval
 
 
 def is_stock_symbol(symbol: str) -> bool:

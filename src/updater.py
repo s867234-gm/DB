@@ -25,6 +25,7 @@ import pandas as pd
 from src.fetcher import (
     TdxFetcher,
     calculate_next_adj_factor,
+    extract_liutongguben,
     get_cn_now,
     parse_daily_bars_to_df,
     parse_minute_bars_to_df,
@@ -96,7 +97,7 @@ class DailyUpdater:
         try:
             # 1. 标的基本信息
             sec_df = con.execute("""
-                SELECT symbol, code, sec_type, delist_date, latest_adj_factor
+                SELECT symbol, code, sec_type, delist_date, latest_adj_factor, liutongguben
                 FROM security_info
                 ORDER BY symbol
             """).df()
@@ -145,6 +146,7 @@ class DailyUpdater:
             last_m_adj = float(row["last_m_adj"]) if (pd.notnull(row.get("last_m_adj")) and not pd.isna(row.get("last_m_adj"))) else None
             latest_adj = float(row["latest_adj_factor"]) if pd.notnull(row["latest_adj_factor"]) else 1.0
             last_daily_adj = float(row["last_daily_adj"]) if pd.notnull(row["last_daily_adj"]) else None
+            liutongguben = extract_liutongguben({"liutongguben": row.get("liutongguben")})
 
             # 检查日线是否需要更新到 daily_target_date
             needs_daily = True
@@ -171,6 +173,7 @@ class DailyUpdater:
                     "code": row["code"],
                     "sec_type": row["sec_type"],
                     "latest_adj_factor": latest_adj,
+                    "liutongguben": liutongguben,
                     "last_daily_adj": last_daily_adj,
                     "last_d_date": last_d,
                     "last_bar_seq": last_seq,
@@ -374,14 +377,29 @@ class DailyUpdater:
         else:
             persisted_adj = latest_adj
 
-        # 5. 计算日线快照
+        # 4.5 个股新日线入库前刷新流通股本 liutongguben（指数与停牌无新日线标的跳过）
+        db_ltgb = extract_liutongguben({"liutongguben": task.get("liutongguben")})
+        active_ltgb = db_ltgb if sec_type == "STOCK" else None
+        liutongguben_changed = False
+        if sec_type == "STOCK" and not df_new_d.empty:
+            fin_info = self.fetcher.fetch_finance_info(sym)
+            fetched_ltgb = extract_liutongguben(fin_info)
+            if fetched_ltgb is not None:
+                if db_ltgb is None or abs(fetched_ltgb - db_ltgb) > 1e-3:
+                    liutongguben_changed = True
+                active_ltgb = fetched_ltgb
+
+        # 5. 计算日线快照与 turn10
         df_d_snap = pd.DataFrame()
         if not df_new_d.empty:
             df_new_d["symbol"] = sym
             df_new_d["code"] = task["code"]
             df_new_d["bar_seq"] = range(last_bar_seq + 1, last_bar_seq + 1 + len(df_new_d))
             df_d_snap, daily_states = MultiCycleKDJEngine.compute_daily_snapshot(
-                df_new_d, init_states=daily_states
+                df_new_d,
+                init_states=daily_states,
+                prev_volumes=task.get("prev_daily_volumes"),
+                liutongguben=active_ltgb,
             )
 
         # 6. 计算 15 分钟线快照
@@ -409,6 +427,8 @@ class DailyUpdater:
             "symbol": sym,
             "latest_adj_factor": persisted_adj,
             "adj_factor_changed": adj_factor_changed,
+            "liutongguben": active_ltgb,
+            "liutongguben_changed": liutongguben_changed,
             "daily_snap": df_d_snap,
             "minute_snap": df_m_snap,
             "state_df": df_state,
@@ -504,6 +524,24 @@ class DailyUpdater:
                 """)
                 con.unregister("tmp_batch_adj")
 
+            ltgb_updates = [
+                {"symbol": r["symbol"], "liutongguben": r["liutongguben"]}
+                for r in batch_results
+                if r.get("liutongguben_changed") and r.get("liutongguben") is not None
+            ]
+            if ltgb_updates:
+                df_ltgb_upd = pd.DataFrame(ltgb_updates).drop_duplicates(
+                    subset=["symbol"], keep="last"
+                )
+                con.register("tmp_batch_ltgb", df_ltgb_upd)
+                con.execute("""
+                    UPDATE security_info s
+                    SET liutongguben = u.liutongguben, updated_at = NOW()
+                    FROM tmp_batch_ltgb u
+                    WHERE s.symbol = u.symbol
+                """)
+                con.unregister("tmp_batch_ltgb")
+
             con.execute("COMMIT;")
             if do_checkpoint:
                 con.execute("CHECKPOINT;")
@@ -593,6 +631,7 @@ class DailyUpdater:
             target_periods = []
 
         states_by_sym: Dict[str, Dict[str, PeriodState]] = {}
+        prev_vols_by_sym: Dict[str, List[float]] = {}
         if target_periods:
             all_symbols = [t["symbol"] for t in tasks]
             period_sql = ", ".join(f"'{p}'" for p in target_periods)
@@ -608,6 +647,26 @@ class DailyUpdater:
                     WHERE s.period IN ({period_sql})
                 """).fetchall()
                 con_st.unregister("tmp_all_syms")
+
+                if any_needs_daily:
+                    daily_stock_reqs = [
+                        {"symbol": t["symbol"], "min_seq": max(0, int(t["last_bar_seq"]) - 8)}
+                        for t in tasks
+                        if t["needs_daily"] and t["sec_type"] == "STOCK" and t["last_bar_seq"] >= 0
+                    ]
+                    if daily_stock_reqs:
+                        con_st.register("tmp_vol_req", pd.DataFrame(daily_stock_reqs))
+                        vol_rows = con_st.execute("""
+                            SELECT d.symbol, d.volume
+                            FROM daily_snapshot d
+                            JOIN tmp_vol_req r ON d.symbol = r.symbol AND d.bar_seq >= r.min_seq
+                            ORDER BY d.symbol ASC, d.bar_seq ASC
+                        """).fetchall()
+                        con_st.unregister("tmp_vol_req")
+                        for sym_v, vol_v in vol_rows:
+                            prev_vols_by_sym.setdefault(sym_v, []).append(
+                                float(vol_v) if (vol_v is not None and not pd.isna(vol_v)) else np.nan
+                            )
             finally:
                 con_st.close()
 
@@ -617,6 +676,7 @@ class DailyUpdater:
 
         for t in tasks:
             t["states_dict"] = states_by_sym.get(t["symbol"], {})
+            t["prev_daily_volumes"] = prev_vols_by_sym.get(t["symbol"], [])
 
         t_plan_state = round(time.perf_counter() - t_plan_start, 2)
         logger.info(

@@ -16,19 +16,19 @@ def create_mock_db():
 def test_views_qfq_calculation():
     con = create_mock_db()
 
-    # 插入证券基础信息：最新复权因子为 2.5
+    # 插入证券基础信息：最新复权因子为 2.5，流通股本为 1000 万股
     con.execute("""
-        INSERT INTO security_info (symbol, code, name, sec_type, exchange, latest_adj_factor)
-        VALUES ('SH600000', '600000', '浦发银行', 'STOCK', 'SSE', 2.5)
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, latest_adj_factor, liutongguben)
+        VALUES ('SH600000', '600000', '浦发银行', 'STOCK', 'SSE', 2.5, 10000000.0)
     """)
 
-    # 插入日线数据：历史某日复权因子为 1.25，收盘价 10.0
+    # 插入日线数据：历史某日复权因子为 1.25，收盘价 10.0，turn10 为 12.34
     con.execute("""
         INSERT INTO daily_snapshot (
-            symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor,
+            symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor, turn10,
             sk_1d, sd_1d, skxl_1d, sdxl_1d, mk_1d, md_1d, mkxl_1d, mdxl_1d
         ) VALUES (
-            'SH600000', '600000', '2024-01-02', 1, 9.0, 11.0, 8.5, 10.0, 10000, 100000, 1.25,
+            'SH600000', '600000', '2024-01-02', 1, 9.0, 11.0, 8.5, 10.0, 10000, 100000, 1.25, 12.34,
             50.0, 50.0, 0.0, 0.0, 50.0, 50.0, 0.0, 0.0
         )
     """)
@@ -54,6 +54,8 @@ def test_views_qfq_calculation():
     assert pytest.approx(df_d.iloc[0]["open_qfq"], 1e-4) == 4.5
     assert pytest.approx(df_d.iloc[0]["high_qfq"], 1e-4) == 5.5
     assert pytest.approx(df_d.iloc[0]["low_qfq"], 1e-4) == 4.25
+    assert pytest.approx(df_d.iloc[0]["turn10"], 1e-6) == 12.34
+    assert pytest.approx(df_d.iloc[0]["liutongguben"], 1e-6) == 10000000.0
 
     # 验证 v_minute_qfq
     df_m = con.execute("SELECT * FROM v_minute_qfq WHERE symbol = 'SH600000'").df()

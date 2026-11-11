@@ -71,6 +71,8 @@ D:\DB\
 │   ├── pilot_verify.py     # 阶段 2 核心样本指标与规则 A 核验脚本
 │   ├── run_phase3_full_build.py # 全量构建入口
 │   ├── run_daily_update.py # 日常增量更新命令行运行入口 (带进程互斥文件锁)
+│   ├── add_64d_period.py   # 64d 周期存量扩展与状态回填迁移脚本
+│   ├── add_turn10_and_liutongguben.py # liutongguben 与 turn10 扩展及存量回填脚本
 │   ├── verify_phase4.py    # 阶段 4 增量同步与全库体检核验脚本
 │   └── verify_full_db.py   # 全库数据质量核验与健康体检脚本
 ├── tests/
@@ -110,6 +112,7 @@ D:\DB\
 | `list_date` | DATE | 上市日期 | `1991-04-03` |
 | `delist_date` | DATE | 退市日期（未退市为 NULL） | `NULL` |
 | `latest_adj_factor` | DOUBLE | 最新复权因子（增量更新时自动刷新） | `1.0`, `112.435` |
+| `liutongguben` | DOUBLE | 最新流通股本，单位：股（通过 `pytdx.get_finance_info` 同步，指数为 NULL） | `19405685000.0` |
 | `updated_at` | TIMESTAMP | 元数据最后更新时间戳 | `2026-11-04 14:15:00` |
 
 ### 2. 物理表 `corporate_action`（除权除息与股本事件）
@@ -128,8 +131,9 @@ D:\DB\
 ### 3. 物理表 `daily_snapshot`（日线级多周期快照）
 - **主键**: `(symbol, trade_date)`
 - **覆盖周期**: `1d, 2d, 4d, 8d, 16d, 32d, 64d`（7 个周期平铺）
-- **前 11 列基础行情**:
-  - `symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor`
+- **前 12 列基础行情与换手指标**:
+  - `symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor, turn10`
+  - `turn10`: 个股近 10 个实际交易日累计换手率（%），按 `SUM_10(volume_手) * 10000 / liutongguben` 计算（指数为 NULL）。
 - **后续 56 列指标**（每个周期包含 8 个指标：`sk, sd, skxl, sdxl, mk, md, mkxl, mdxl`）：
   - `sk_1d, sd_1d, skxl_1d, sdxl_1d, mk_1d, md_1d, mkxl_1d, mdxl_1d`
   - `sk_2d, sd_2d, skxl_2d, sdxl_2d, mk_2d, md_2d, mkxl_2d, mdxl_2d`
@@ -175,7 +179,7 @@ D:\DB\
 | `updated_at` | TIMESTAMP | 状态最后更新时间 |
 
 ### 6. 便捷视图 `v_daily_qfq` 与 `v_minute_qfq`
-基于 `daily_snapshot` 和 `minute_snapshot` 动态关联 `security_info.latest_adj_factor`，提供即开即用的前复权行情与完整 56 / 32 列指标：
+基于 `daily_snapshot` 和 `minute_snapshot` 动态关联 `security_info`（`latest_adj_factor`、`liutongguben`），提供即开即用的前复权行情、`turn10` / `liutongguben` 及完整 56 / 32 列指标：
 - `open_qfq = open * adj_factor / latest_adj_factor`
 - `high_qfq = high * adj_factor / latest_adj_factor`
 - `low_qfq = low * adj_factor / latest_adj_factor`

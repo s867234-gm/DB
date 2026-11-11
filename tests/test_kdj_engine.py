@@ -304,3 +304,48 @@ def test_64d_period_bucket_closing_and_incremental():
     assert np.isclose(st_64d.md_closed, st_inc_64d.md_closed)
 
 
+def test_turn10_calculation_and_incremental_continuity():
+    """测试 10 日累计换手率 turn10 (%) 计算、不足10日窗口、含 NaN 成交量及增量衔接"""
+    ltgb = 100_000_000.0  # 1 亿股
+    df = generate_mock_daily_data(n_bars=25, seed=321)
+    # 设定精确成交量 (手) 以便校验: 第 i 根为 (i + 1) * 100 手
+    df['volume'] = np.array([(i + 1) * 100.0 for i in range(25)], dtype=np.float64)
+
+    # 1. 全量计算
+    df_full, states_full = MultiCycleKDJEngine.compute_daily_snapshot(df, liutongguben=ltgb)
+    assert 'turn10' in df_full.columns
+
+    # 第 0 根 (不足10根): 100 * 10000 / 1e8 = 0.01%
+    assert np.isclose(df_full['turn10'].iloc[0], 0.01)
+    # 第 8 根 (前 9 根累加): sum(1..9)*100 = 4500 手 -> 4500 * 10000 / 1e8 = 0.45%
+    assert np.isclose(df_full['turn10'].iloc[8], 0.45)
+    # 第 9 根 (前 10 根累加): sum(1..10)*100 = 5500 手 -> 0.55%
+    assert np.isclose(df_full['turn10'].iloc[9], 0.55)
+    # 第 10 根 (bar 1..10): sum(2..11)*100 = 6500 手 -> 0.65%
+    assert np.isclose(df_full['turn10'].iloc[10], 0.65)
+
+    # 2. 分段增量衔接 (前 20 根 + 后 5 根，传入最近 9 根历史成交量)
+    split = 20
+    df_p1, st_p1 = MultiCycleKDJEngine.compute_daily_snapshot(df.iloc[:split], liutongguben=ltgb)
+    prev_9 = df['volume'].iloc[split - 9 : split].tolist()
+    df_p2, _ = MultiCycleKDJEngine.compute_daily_snapshot(
+        df.iloc[split:], init_states=st_p1, prev_volumes=prev_9, liutongguben=ltgb
+    )
+    df_inc = pd.concat([df_p1, df_p2], ignore_index=True)
+    np.testing.assert_allclose(df_full['turn10'].to_numpy(), df_inc['turn10'].to_numpy(), rtol=1e-12, atol=1e-12)
+
+    # 3. 含 NaN 成交量：窗口命中 NaN 必须为 NaN（严禁填 0），离开 10 根窗口后恢复
+    df_nan = df.copy()
+    df_nan.loc[5, 'volume'] = np.nan
+    df_nan_out, _ = MultiCycleKDJEngine.compute_daily_snapshot(df_nan, liutongguben=ltgb)
+    assert np.isclose(df_nan_out['turn10'].iloc[4], sum(range(1, 6)) * 100.0 * 10000.0 / ltgb)
+    assert np.isnan(df_nan_out['turn10'].iloc[5 : 15]).all()
+    assert np.isfinite(df_nan_out['turn10'].iloc[15])
+
+    # 4. 无流通股本时全为 NaN
+    df_no_ltgb, _ = MultiCycleKDJEngine.compute_daily_snapshot(df, liutongguben=None)
+    assert np.isnan(df_no_ltgb['turn10']).all()
+    df_zero_ltgb, _ = MultiCycleKDJEngine.compute_daily_snapshot(df, liutongguben=0.0)
+    assert np.isnan(df_zero_ltgb['turn10']).all()
+
+

@@ -1,8 +1,9 @@
 import json
+import math
 import numpy as np
 import pandas as pd
 import numba as nb
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional, Sequence
 from dataclasses import dataclass, asdict
 
 # 基础与指标列定义常量
@@ -16,7 +17,7 @@ METRIC_COLS_TEMPLATE = ['sk_{p}', 'sd_{p}', 'skxl_{p}', 'sdxl_{p}', 'mk_{p}', 'm
 
 # 严格匹配 schema.py 的物理表列顺序定义
 DAILY_SNAPSHOT_COLUMNS = [
-    'symbol', 'code', 'trade_date', 'bar_seq', 'open', 'high', 'low', 'close', 'volume', 'amount', 'adj_factor'
+    'symbol', 'code', 'trade_date', 'bar_seq', 'open', 'high', 'low', 'close', 'volume', 'amount', 'adj_factor', 'turn10'
 ] + [tmpl.format(p=p) for p in DAILY_PERIOD_NAMES for tmpl in METRIC_COLS_TEMPLATE]
 
 MINUTE_SNAPSHOT_COLUMNS = [
@@ -313,12 +314,52 @@ class MultiCycleKDJEngine:
     """多周期合成与 KDJ 计算引擎"""
 
     @staticmethod
+    def _compute_turn10_array(
+        volumes: np.ndarray,
+        prev_volumes: Optional[Sequence[float]],
+        liutongguben: Optional[float],
+    ) -> np.ndarray:
+        """计算 10 日累计换手率 (%): 10日累计成交股数 / 流通股本 = SUM_10(volume_手) * 10000.0 / liutongguben。
+        window 不足 10 根时按实际可用根数累加；若窗口内任一交易日 volume 为 NaN，对应 turn10 置为 NaN（严禁填 0）。
+        """
+        n = len(volumes)
+        out = np.full(n, np.nan, dtype=np.float64)
+        if liutongguben is None:
+            return out
+        try:
+            ltgb = float(liutongguben)
+        except (TypeError, ValueError):
+            return out
+        if not math.isfinite(ltgb) or ltgb <= 0.0 or n == 0:
+            return out
+
+        if prev_volumes:
+            tail_prev = list(prev_volumes)[-9:]
+            prefix = np.array(
+                [float(v) if v is not None else np.nan for v in tail_prev],
+                dtype=np.float64,
+            )
+        else:
+            prefix = np.empty(0, dtype=np.float64)
+
+        all_vols = np.concatenate([prefix, volumes.astype(np.float64, copy=False)])
+        p_len = len(prefix)
+        for t in range(n):
+            idx = p_len + t
+            win = all_vols[max(0, idx - 9) : idx + 1]
+            if not np.isnan(win).any():
+                out[t] = (float(np.sum(win)) * 10000.0) / ltgb
+        return out
+
+    @staticmethod
     def compute_daily_snapshot(
         df_daily: pd.DataFrame,
-        init_states: Optional[Dict[str, PeriodState]] = None
+        init_states: Optional[Dict[str, PeriodState]] = None,
+        prev_volumes: Optional[Sequence[float]] = None,
+        liutongguben: Optional[float] = None,
     ) -> Tuple[pd.DataFrame, Dict[str, PeriodState]]:
         """
-        计算日线全历史 7 个周期 (1d, 2d, 4d, 8d, 16d, 32d, 64d) 快照与最新状态
+        计算日线全历史 7 个周期 (1d, 2d, 4d, 8d, 16d, 32d, 64d) 快照、turn10 与最新状态
         """
         if df_daily.empty:
             return pd.DataFrame(columns=DAILY_SNAPSHOT_COLUMNS), (init_states or {})
@@ -326,6 +367,11 @@ class MultiCycleKDJEngine:
         df = df_daily.copy()
         if 'bar_seq' not in df.columns:
             df['bar_seq'] = np.arange(len(df), dtype=np.int32)
+
+        volumes_arr = pd.to_numeric(df['volume'], errors='coerce').to_numpy(dtype=np.float64)
+        df['turn10'] = MultiCycleKDJEngine._compute_turn10_array(
+            volumes_arr, prev_volumes=prev_volumes, liutongguben=liutongguben
+        )
 
         # 确保复权列存在
         adj_factor = df['adj_factor'].to_numpy(dtype=np.float64)

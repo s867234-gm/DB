@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS security_info (
     list_date DATE,
     delist_date DATE,
     latest_adj_factor DOUBLE DEFAULT 1.0,
+    liutongguben DOUBLE,
     updated_at TIMESTAMP
 );
 
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS daily_snapshot (
     volume DOUBLE,
     amount DOUBLE,
     adj_factor DOUBLE NOT NULL,
+    turn10 DOUBLE,
     -- 1d (8列)
     sk_1d DOUBLE, sd_1d DOUBLE, skxl_1d DOUBLE, sdxl_1d DOUBLE,
     mk_1d DOUBLE, md_1d DOUBLE, mkxl_1d DOUBLE, mdxl_1d DOUBLE,
@@ -154,6 +156,8 @@ SELECT
     d.volume,
     d.amount,
     d.adj_factor,
+    d.turn10,
+    s.liutongguben,
     d.sk_1d, d.sd_1d, d.skxl_1d, d.sdxl_1d, d.mk_1d, d.md_1d, d.mkxl_1d, d.mdxl_1d,
     d.sk_2d, d.sd_2d, d.skxl_2d, d.sdxl_2d, d.mk_2d, d.md_2d, d.mkxl_2d, d.mdxl_2d,
     d.sk_4d, d.sd_4d, d.skxl_4d, d.sdxl_4d, d.mk_4d, d.md_4d, d.mkxl_4d, d.mdxl_4d,
@@ -217,6 +221,7 @@ def init_security_info(conn: duckdb.DuckDBPyConnection, source_conn: duckdb.Duck
             list_date,
             delist_date,
             1.0 AS latest_adj_factor,
+            NULL::DOUBLE AS liutongguben,
             CURRENT_TIMESTAMP AS updated_at
         FROM stock_basic
         WHERE exchange IN ('SSE', 'SZSE')
@@ -251,6 +256,7 @@ def init_security_info(conn: duckdb.DuckDBPyConnection, source_conn: duckdb.Duck
             'list_date': None,
             'delist_date': None,
             'latest_adj_factor': 1.0,
+            'liutongguben': None,
             'updated_at': None
         })
     
@@ -260,8 +266,9 @@ def init_security_info(conn: duckdb.DuckDBPyConnection, source_conn: duckdb.Duck
 
     conn.register("df_all_sec", all_sec_df)
     conn.execute("""
-        INSERT OR REPLACE INTO security_info 
-        SELECT symbol, code, name, sec_type, exchange, board, list_date, delist_date, latest_adj_factor, CURRENT_TIMESTAMP
+        INSERT OR REPLACE INTO security_info BY NAME
+        SELECT symbol, code, name, sec_type, exchange, board, list_date, delist_date,
+               latest_adj_factor, liutongguben, CURRENT_TIMESTAMP AS updated_at
         FROM df_all_sec
     """)
     conn.unregister("df_all_sec")

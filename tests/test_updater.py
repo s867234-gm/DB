@@ -16,6 +16,7 @@ from src.fetcher import (
     TdxConnectionPool,
     TdxFetcher,
     calculate_next_adj_factor,
+    extract_liutongguben,
     parse_daily_bars_to_df,
     parse_minute_bars_to_df,
 )
@@ -1111,6 +1112,276 @@ def test_connection_pool_subnet_quota_circuit_breaker_and_empty_bars(monkeypatch
     assert disconnect_calls["n"] == 2
     assert sum(pool._fail_counts.values()) >= 3
     pool.disconnect_thread()
+
+
+def test_fetch_finance_info_and_extract_liutongguben(monkeypatch):
+    """测试 fetch_finance_info（指数跳过、异常重连重试）与 extract_liutongguben 校验"""
+    assert extract_liutongguben(None) is None
+    assert extract_liutongguben({}) is None
+    assert extract_liutongguben({"liutongguben": 0.0}) is None
+    assert extract_liutongguben({"liutongguben": -100.0}) is None
+    assert extract_liutongguben({"liutongguben": float("nan")}) is None
+    assert extract_liutongguben({"liutongguben": 19405685000.0}) == 19405685000.0
+
+    pool = TdxConnectionPool(servers=[("10.0.0.1", 7709, "s1"), ("10.0.0.2", 7709, "s2")])
+    fetcher = TdxFetcher(pool=pool)
+
+    # 指数绝不发起网络请求
+    assert fetcher.fetch_finance_info("SH000001") is None
+    assert fetcher.fetch_finance_info("TDX880301") is None
+
+    call_ips = []
+
+    class FinMockApi:
+        def __init__(self, heartbeat=False):
+            self.ip = None
+            self.client = None
+
+        def connect(self, ip, port, time_out=2.0):
+            self.ip = ip
+            self.client = object()
+            return True
+
+        def disconnect(self):
+            self.client = None
+
+        def get_security_bars(self, category, market, code, start, count):
+            return [{"close": 1.0}]
+
+        def get_finance_info(self, market, code):
+            call_ips.append(self.ip)
+            if self.ip == "10.0.0.1":
+                return None
+            return {"market": market, "code": code, "liutongguben": 1250081562.5}
+
+    monkeypatch.setattr("src.fetcher.TdxHq_API", FinMockApi)
+    fin = fetcher.fetch_finance_info("SH600519")
+    assert fin == {"market": 1, "code": "600519", "liutongguben": 1250081562.5}
+    assert call_ips == ["10.0.0.1", "10.0.0.2"]
+    pool.disconnect_thread()
+
+
+def test_updater_liutongguben_and_turn10_incremental_persistence(tmp_path):
+    """测试 DailyUpdater 自动刷新流通股本、持久化 turn10（含股本变更、0值保护、指数排除及 v_daily_qfq 查询）"""
+    db_file = str(tmp_path / "test_turn10_updater.duckdb")
+    con = duckdb.connect(db_file)
+    create_tables(con)
+    con.execute("""
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, board, latest_adj_factor, liutongguben)
+        VALUES
+            ('SZ000001', '000001', '平安银行', 'STOCK', 'SZSE', 'MAIN', 1.0, NULL),
+            ('SZ000002', '000002', '万科A', 'STOCK', 'SZSE', 'MAIN', 1.0, 100000000.0),
+            ('SH600519', '600519', '贵州茅台', 'STOCK', 'SSE', 'MAIN', 1.0, 50000000.0),
+            ('SH000001', '000001', '上证指数', 'BROAD_INDEX', 'SSE', 'INDEX', 1.0, NULL)
+    """)
+
+    # 写入前 10 根日线 (2026-10-01 起 10 个工作日, bar_seq 0..9)
+    dates = pd.date_range("2026-10-01", periods=10, freq="B").date
+    all_init_d = []
+    all_init_s = []
+    for sym, code, sec_t, ltgb_init, base_vol in [
+        ("SZ000001", "000001", "STOCK", None, 1000.0),
+        ("SZ000002", "000002", "STOCK", 100_000_000.0, 2000.0),
+        ("SH600519", "600519", "STOCK", 50_000_000.0, 500.0),
+        ("SH000001", "000001", "BROAD_INDEX", None, 900000.0),
+    ]:
+        rows = []
+        for i, d in enumerate(dates):
+            v = np.nan if (sym == "SH600519" and i == 5) else base_vol
+            rows.append({
+                "symbol": sym, "code": code, "trade_date": d, "bar_seq": i,
+                "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.2,
+                "volume": v, "amount": 10000.0, "adj_factor": 1.0,
+            })
+        df_s, st_s = MultiCycleKDJEngine.compute_daily_snapshot(pd.DataFrame(rows), liutongguben=ltgb_init)
+        all_init_d.append(df_s)
+        all_init_s.extend(st_s.values())
+
+    con.register("tmp_d", pd.concat(all_init_d, ignore_index=True))
+    con.execute("INSERT INTO daily_snapshot BY NAME SELECT * FROM tmp_d")
+    con.register("tmp_s", states_to_df(all_init_s))
+    con.execute("INSERT INTO incremental_state BY NAME SELECT * FROM tmp_s")
+    con.close()
+
+    # 下一交易日 2026-10-15 收盘后增量更新
+    d1 = datetime.date(2026, 10, 15)
+    mock_fetcher = MagicMock()
+    mock_fetcher.get_latest_market_dates.return_value = (d1, d1, True)
+    mock_fetcher.get_latest_market_status.return_value = (d1, True)
+    mock_fetcher.fetch_xdxr_events.return_value = []
+    mock_fetcher.fetch_minute_bars.return_value = []
+
+    def mock_daily_bars(symbol, sec_type, offset=15):
+        vol_map = {"SZ000001": 200000, "SZ000002": 200000, "SH600519": 50000, "SH000001": 800000}
+        return [{
+            "datetime": "2026-10-15", "open": 10.0, "high": 10.5, "low": 9.5,
+            "close": 10.3, "vol": vol_map[symbol], "amount": 200000,
+        }]
+
+    def mock_finance_info(symbol):
+        # SZ000001 首次写入 1 亿股；SZ000002 返回 0.0 应保留原 1 亿股；SH600519 返回 5000 万股；指数绝不应被写入
+        return {
+            "SZ000001": {"liutongguben": 100_000_000.0},
+            "SZ000002": {"liutongguben": 0.0},
+            "SH600519": {"liutongguben": 50_000_000.0},
+        }.get(symbol)
+
+    mock_fetcher.fetch_daily_bars.side_effect = mock_daily_bars
+    mock_fetcher.fetch_finance_info.side_effect = mock_finance_info
+
+    updater = DailyUpdater(db_path=db_file, fetcher=mock_fetcher)
+    res1 = updater.run_update(allow_intraday=False)
+    assert res1["status"] == "SUCCESS"
+    assert res1["daily_rows_added"] == 4
+
+    con = duckdb.connect(db_file, read_only=True)
+    # 1. SZ000001: 前9日(9*1000手) + 本日(2000手) = 11000手 * 10000 / 1e8 = 1.1%
+    r_01 = con.execute(
+        "SELECT turn10, liutongguben FROM v_daily_qfq WHERE symbol='SZ000001' AND trade_date='2026-10-15'"
+    ).fetchone()
+    assert np.isclose(r_01[0], 1.1)
+    assert np.isclose(r_01[1], 100_000_000.0)
+
+    # 2. SZ000002: fetch_finance_info 返回 0.0，保留原 DB 1e8，前9日(9*2000) + 本日(2000) = 20000手 -> 2.0%
+    r_02 = con.execute(
+        "SELECT turn10, liutongguben FROM v_daily_qfq WHERE symbol='SZ000002' AND trade_date='2026-10-15'"
+    ).fetchone()
+    assert np.isclose(r_02[0], 2.0)
+    assert np.isclose(r_02[1], 100_000_000.0)
+
+    # 3. SH600519: 前9根中包含 i=5 (volume=NULL)，故本日窗口含 NULL -> turn10 必须为 NULL
+    r_mt = con.execute(
+        "SELECT turn10, liutongguben FROM v_daily_qfq WHERE symbol='SH600519' AND trade_date='2026-10-15'"
+    ).fetchone()
+    assert r_mt[0] is None
+    assert np.isclose(r_mt[1], 50_000_000.0)
+
+    # 4. SH000001: 指数不计算 turn10 且不写入 liutongguben
+    r_idx = con.execute(
+        "SELECT turn10, liutongguben FROM v_daily_qfq WHERE symbol='SH000001' AND trade_date='2026-10-15'"
+    ).fetchone()
+    assert r_idx == (None, None)
+    con.close()
+
+    # 再过一个交易日 2026-10-16：模拟 SZ000001 限售股解禁（流通股本翻倍至 2 亿股）
+    d2 = datetime.date(2026, 10, 16)
+    mock_fetcher.get_latest_market_dates.return_value = (d2, d2, True)
+    mock_fetcher.get_latest_market_status.return_value = (d2, True)
+    mock_fetcher.fetch_daily_bars.side_effect = lambda sym, sec_type, offset=15: [{
+        "datetime": "2026-10-16", "open": 10.3, "high": 10.6, "low": 10.2,
+        "close": 10.5, "vol": 200000, "amount": 210000,
+    }]
+    mock_fetcher.fetch_finance_info.side_effect = lambda sym: (
+        {"liutongguben": 200_000_000.0} if sym == "SZ000001" else {"liutongguben": 50_000_000.0}
+    )
+
+    res2 = updater.run_update(allow_intraday=False)
+    assert res2["status"] == "SUCCESS"
+
+    con = duckdb.connect(db_file, read_only=True)
+    # SZ000001 2026-10-16: 前8日(8*1000) + 10-15(2000) + 10-16(2000) = 12000手 * 10000 / 2e8 = 0.6%
+    # 同时 2026-10-15 的历史 turn10 仍保持 1.1% 不被污染
+    hist_01 = con.execute(
+        "SELECT trade_date, turn10 FROM daily_snapshot WHERE symbol='SZ000001' AND trade_date >= '2026-10-15' ORDER BY trade_date"
+    ).fetchall()
+    ltgb_01_new = con.execute(
+        "SELECT liutongguben FROM security_info WHERE symbol='SZ000001'"
+    ).fetchone()[0]
+    con.close()
+    assert np.isclose(hist_01[0][1], 1.1)
+    assert np.isclose(hist_01[1][1], 0.6)
+    assert np.isclose(ltgb_01_new, 200_000_000.0)
+
+
+def test_migration_add_turn10_and_liutongguben(tmp_path):
+    """测试迁移脚本对老旧库升级 schema/views、v1 历史对齐、未覆盖行补算与幂等重跑"""
+    from scripts.add_turn10_and_liutongguben import backfill_turn10, upgrade_schema_and_views
+
+    db_file = str(tmp_path / "legacy_adb.duckdb")
+    v1_file = str(tmp_path / "mock_v1.duckdb")
+
+    # 1. 构建不含 liutongguben 与 turn10 的旧结构 A_DB
+    con = duckdb.connect(db_file)
+    con.execute("""
+        CREATE TABLE security_info (
+            symbol VARCHAR PRIMARY KEY,
+            code VARCHAR NOT NULL,
+            name VARCHAR,
+            sec_type VARCHAR NOT NULL,
+            exchange VARCHAR NOT NULL,
+            board VARCHAR,
+            list_date DATE,
+            delist_date DATE,
+            latest_adj_factor DOUBLE DEFAULT 1.0,
+            updated_at TIMESTAMP
+        );
+        CREATE TABLE daily_snapshot (
+            symbol VARCHAR NOT NULL, code VARCHAR NOT NULL, trade_date DATE NOT NULL, bar_seq INTEGER NOT NULL,
+            open DOUBLE NOT NULL, high DOUBLE NOT NULL, low DOUBLE NOT NULL, close DOUBLE NOT NULL,
+            volume DOUBLE, amount DOUBLE, adj_factor DOUBLE NOT NULL,
+            sk_1d DOUBLE, sd_1d DOUBLE, skxl_1d DOUBLE, sdxl_1d DOUBLE, mk_1d DOUBLE, md_1d DOUBLE, mkxl_1d DOUBLE, mdxl_1d DOUBLE,
+            sk_2d DOUBLE, sd_2d DOUBLE, skxl_2d DOUBLE, sdxl_2d DOUBLE, mk_2d DOUBLE, md_2d DOUBLE, mkxl_2d DOUBLE, mdxl_2d DOUBLE,
+            sk_4d DOUBLE, sd_4d DOUBLE, skxl_4d DOUBLE, sdxl_4d DOUBLE, mk_4d DOUBLE, md_4d DOUBLE, mkxl_4d DOUBLE, mdxl_4d DOUBLE,
+            sk_8d DOUBLE, sd_8d DOUBLE, skxl_8d DOUBLE, sdxl_8d DOUBLE, mk_8d DOUBLE, md_8d DOUBLE, mkxl_8d DOUBLE, mdxl_8d DOUBLE,
+            sk_16d DOUBLE, sd_16d DOUBLE, skxl_16d DOUBLE, sdxl_16d DOUBLE, mk_16d DOUBLE, md_16d DOUBLE, mkxl_16d DOUBLE, mdxl_16d DOUBLE,
+            sk_32d DOUBLE, sd_32d DOUBLE, skxl_32d DOUBLE, sdxl_32d DOUBLE, mk_32d DOUBLE, md_32d DOUBLE, mkxl_32d DOUBLE, mdxl_32d DOUBLE,
+            sk_64d DOUBLE, sd_64d DOUBLE, skxl_64d DOUBLE, sdxl_64d DOUBLE, mk_64d DOUBLE, md_64d DOUBLE, mkxl_64d DOUBLE, mdxl_64d DOUBLE,
+            PRIMARY KEY (symbol, trade_date)
+        );
+        CREATE TABLE minute_snapshot (
+            symbol VARCHAR NOT NULL, code VARCHAR NOT NULL, trading_date DATE NOT NULL, bar_end TIMESTAMP NOT NULL, slot_seq TINYINT NOT NULL,
+            open DOUBLE NOT NULL, high DOUBLE NOT NULL, low DOUBLE NOT NULL, close DOUBLE NOT NULL,
+            volume DOUBLE, amount DOUBLE, adj_factor DOUBLE NOT NULL,
+            sk_15m DOUBLE, sd_15m DOUBLE, skxl_15m DOUBLE, sdxl_15m DOUBLE, mk_15m DOUBLE, md_15m DOUBLE, mkxl_15m DOUBLE, mdxl_15m DOUBLE,
+            sk_30m DOUBLE, sd_30m DOUBLE, skxl_30m DOUBLE, sdxl_30m DOUBLE, mk_30m DOUBLE, md_30m DOUBLE, mkxl_30m DOUBLE, mdxl_30m DOUBLE,
+            sk_60m DOUBLE, sd_60m DOUBLE, skxl_60m DOUBLE, sdxl_60m DOUBLE, mk_60m DOUBLE, md_60m DOUBLE, mkxl_60m DOUBLE, mdxl_60m DOUBLE,
+            sk_120m DOUBLE, sd_120m DOUBLE, skxl_120m DOUBLE, sdxl_120m DOUBLE, mk_120m DOUBLE, md_120m DOUBLE, mkxl_120m DOUBLE, mdxl_120m DOUBLE,
+            PRIMARY KEY (symbol, bar_end)
+        );
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, latest_adj_factor)
+        VALUES
+            ('SZ000001', '000001', '平安银行', 'STOCK', 'SZSE', 1.0),
+            ('SH000001', '000001', '上证指数', 'BROAD_INDEX', 'SSE', 1.0);
+        INSERT INTO daily_snapshot (symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor)
+        VALUES
+            ('SZ000001', '000001', '2026-11-10', 0, 10.0, 10.2, 9.9, 10.1, 1000.0, 10100.0, 1.0),
+            ('SZ000001', '000001', '2026-11-11', 1, 10.1, 10.3, 10.0, 10.2, 2000.0, 20400.0, 1.0),
+            ('SH000001', '000001', '2026-11-10', 0, 3000.0, 3010.0, 2990.0, 3005.0, 100000.0, 1000000.0, 1.0);
+    """)
+
+    # 2. 构建模拟源库 v1：仅包含 2026-11-10 的历史精确 turn10=9.99，不包含 2026-11-11
+    con_v1 = duckdb.connect(v1_file)
+    con_v1.execute("""
+        CREATE TABLE stock_daily_feature_snapshot (
+            symbol VARCHAR, trade_date TIMESTAMP, turn10 DOUBLE
+        );
+        INSERT INTO stock_daily_feature_snapshot VALUES ('SZ000001', TIMESTAMP '2026-11-10 00:00:00', 9.99);
+    """)
+    con_v1.close()
+
+    # 3. 执行结构升级与写入流通股本 1 亿股
+    upgrade_schema_and_views(con)
+    con.execute("UPDATE security_info SET liutongguben = 100000000.0 WHERE symbol = 'SZ000001'")
+
+    # 4. 首次回填：11-10 应严格对齐 v1 (9.99)，11-11 应补算 (1000+2000)*10000/1e8 = 0.3%，指数保持 NULL
+    changed1 = backfill_turn10(con, source_db_path=v1_file, batch_size=500)
+    assert changed1 == 2
+
+    rows = con.execute("""
+        SELECT symbol, trade_date, turn10, liutongguben
+        FROM v_daily_qfq
+        ORDER BY symbol, trade_date
+    """).fetchall()
+    # rows sorted by symbol: SH000001, SZ000001(11-10), SZ000001(11-11)
+    assert rows[0][2] is None and rows[0][3] is None
+    assert np.isclose(rows[1][2], 9.99)
+    assert np.isclose(rows[2][2], 0.3)
+    assert np.isclose(rows[2][3], 100_000_000.0)
+
+    # 5. 二次重跑严格幂等（更新 0 行）
+    changed2 = backfill_turn10(con, source_db_path=v1_file, batch_size=500)
+    assert changed2 == 0
+    con.close()
 
 
 
