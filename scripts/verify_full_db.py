@@ -64,6 +64,7 @@ def verify_database(db_path: str = DEFAULT_DB_PATH):
             count(CASE WHEN sk_1d IS NULL OR isnan(sk_1d) THEN 1 END) as null_sk_1d,
             count(CASE WHEN sk_32d IS NULL OR isnan(sk_32d) THEN 1 END) as null_sk_32d,
             count(CASE WHEN sk_64d IS NULL OR isnan(sk_64d) THEN 1 END) as null_sk_64d,
+            count(CASE WHEN sk_128d IS NULL OR isnan(sk_128d) THEN 1 END) as null_sk_128d,
             count(CASE WHEN turn10 IS NOT NULL AND (isnan(turn10) OR isinf(turn10) OR turn10 < 0 OR (turn10 > 0 AND turn10 < 1e-7)) THEN 1 END) as invalid_turn10
         FROM daily_snapshot
     """).fetchone()
@@ -81,14 +82,15 @@ def verify_database(db_path: str = DEFAULT_DB_PATH):
         'null_sk_1d': d_stat[4],
         'null_sk_32d': d_stat[5],
         'null_sk_64d': d_stat[6],
-        'invalid_turn10': d_stat[7],
+        'null_sk_128d': d_stat[7],
+        'invalid_turn10': d_stat[8],
         'idx_turn10_cnt': idx_turn10_cnt,
     }
     print(
         f"日线快照 (daily_snapshot): {d_stat[0]:,} 行 | 覆盖标的: {d_stat[1]:,} | 日期: {d_stat[2]} ~ {d_stat[3]} | "
-        f"KDJ空值异常: {d_stat[4] + d_stat[5] + d_stat[6]} | turn10异常(NaN/Inf/<0/次正规): {d_stat[7]} | 指数turn10非空: {idx_turn10_cnt}"
+        f"KDJ空值异常: {d_stat[4] + d_stat[5] + d_stat[6] + d_stat[7]} | turn10异常(NaN/Inf/<0/次正规): {d_stat[8]} | 指数turn10非空: {idx_turn10_cnt}"
     )
-    assert d_stat[7] == 0, f"Error: Found {d_stat[7]} invalid turn10 rows (NaN/Inf/<0/subnormal)!"
+    assert d_stat[8] == 0, f"Error: Found {d_stat[8]} invalid turn10 rows (NaN/Inf/<0/subnormal)!"
     assert idx_turn10_cnt == 0, f"Error: Found {idx_turn10_cnt} non-STOCK daily rows with non-NULL turn10!"
 
     # 3. minute_snapshot 统计
@@ -124,8 +126,8 @@ def verify_database(db_path: str = DEFAULT_DB_PATH):
         'total_rows': inc_stat[0],
         'symbol_count': inc_stat[1]
     }
-    print(f"增量状态 (incremental_state): {inc_stat[0]:,} 行 (每标的 11 周期状态, 覆盖标的: {inc_stat[1]:,})")
-    assert inc_stat[0] == total_sec * 11, f"Error: Expected {total_sec * 11} incremental state rows, got {inc_stat[0]}!"
+    print(f"增量状态 (incremental_state): {inc_stat[0]:,} 行 (每标的 12 周期状态, 覆盖标的: {inc_stat[1]:,})")
+    assert inc_stat[0] == total_sec * 12, f"Error: Expected {total_sec * 12} incremental state rows, got {inc_stat[0]}!"
 
     # 5. 核心样本标的真实前复权视图查询验证 (2024-10-08 与 2026-10-30)
     samples_verification = {}
@@ -198,7 +200,7 @@ def generate_full_build_report(data: dict):
     md.append("| :--- | :--- | :--- | :--- | :--- |")
     md.append(f"| **`daily_snapshot`** | **{d_s['total_rows']:,}** 行 | {d_s['symbol_count']:,} 只 | `{d_s['min_date']}` ~ `{d_s['max_date']}` | **0 NULL / 0 NaN / turn10 0 异常** (全量闭环) |")
     md.append(f"| **`minute_snapshot`** | **{m_s['total_rows']:,}** 行 | {m_s['symbol_count']:,} 只 | `{m_s['min_bar_end']}` ~ `{m_s['max_bar_end']}` | **0 NULL / 0 残留早于2024-10-01数据** |")
-    md.append(f"| **`incremental_state`** | **{i_s['total_rows']:,}** 行 | {i_s['symbol_count']:,} 只 | 覆盖全市场 11 个完整周期 | **恰好等于 5,335 × 11 = 58,685 行** |")
+    md.append(f"| **`incremental_state`** | **{i_s['total_rows']:,}** 行 | {i_s['symbol_count']:,} 只 | 覆盖全市场 12 个完整周期 | **恰好等于 5,335 × 12 = 64,020 行** |")
     md.append(f"| **`corporate_action`** | **179,285** 行 | 5,228 只 | 1990-03-01 ~ 2026-11-06 | 原始事件追溯链完整 |\n")
 
     md.append("\n---\n## 三、核心标的真实前复权视图查询验证 (`v_daily_qfq` & `v_minute_qfq`)\n")
@@ -228,7 +230,7 @@ def generate_full_build_report(data: dict):
     md.append("1. **列顺序错位与按列插入彻底根治**：通过严格约束物理列规范和 DuckDB `BY NAME` 语法，各列数据严格吻合；")
     md.append("2. **北交所 BJ 纯净性确认**：全市场 5,335 只标的仅收录沪深 A 股及指定指数，无任何北交所杂质；")
     md.append(f"3. **数据库文件紧凑高性能**：全市场历史日线与分钟线全周期指标物化后，总库大小仅 **{data['db_size_gb']:.2f} GB**，单机即可实现毫秒级即席 OLAP 查询！")
-    md.append("4. **增量状态持久化就绪**：58,685 条增量状态就绪，支撑后续日常毫秒级增量更新。\n")
+    md.append("4. **增量状态持久化就绪**：64,020 条增量状态就绪，支撑后续日常毫秒级增量更新。\n")
 
     with open("D:/DB/docs/phase3_full_build_report.md", "w", encoding="utf-8") as f:
         f.write("\n".join(md))

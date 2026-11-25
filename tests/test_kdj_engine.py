@@ -397,4 +397,49 @@ def test_closed_highs_overflow_truncation_guard():
     np.testing.assert_allclose(df_over['mk_1d'].to_numpy(), df_tail['mk_1d'].to_numpy(), rtol=1e-12, atol=1e-12)
 
 
+def test_128d_period_bucket_closing_and_incremental():
+    """测试 128d 周期的分桶闭合规则与分段增量计算精度"""
+    df = generate_mock_daily_data(n_bars=300, seed=456)
+
+    # 1. 全量计算
+    df_full, full_states = MultiCycleKDJEngine.compute_daily_snapshot(df)
+
+    # 断言包含 128d 的全部 8 列
+    expected_128d_cols = [f"{metric}_128d" for metric in ['sk', 'sd', 'skxl', 'sdxl', 'mk', 'md', 'mkxl', 'mdxl']]
+    for c in expected_128d_cols:
+        assert c in df_full.columns, f"Missing 128d column: {c}"
+
+    # 断言 128d 状态:
+    # 300 根 bar (bar_seq 0..299):
+    # - 第 0 桶闭合在 bar_seq=127 (last_closed_bucket_id=0)
+    # - 第 1 桶闭合在 bar_seq=255 (last_closed_bucket_id=1)
+    # - 剩余未闭合 bar_count = 300 - 256 = 44
+    st_128d = full_states['128d']
+    assert st_128d.last_closed_bucket_id == 1
+    assert st_128d.bar_count == 44
+    assert len(st_128d.closed_highs_adj) == 2
+    assert len(st_128d.closed_lows_adj) == 2
+
+    # 2. 切分为前 200 根 + 后 100 根进行分段增量计算
+    split_idx = 200
+    df_part1, states_part1 = MultiCycleKDJEngine.compute_daily_snapshot(df.iloc[:split_idx].copy())
+    df_part2, states_part2 = MultiCycleKDJEngine.compute_daily_snapshot(df.iloc[split_idx:].copy(), init_states=states_part1)
+    df_inc = pd.concat([df_part1, df_part2], ignore_index=True)
+
+    # 验证 128d 全部 8 列指标的最大绝对误差 < 1e-12
+    for c in expected_128d_cols:
+        diff = np.max(np.abs(df_full[c].to_numpy() - df_inc[c].to_numpy()))
+        assert diff < 1e-12, f"128d metric discrepancy in {c}: max_diff={diff}"
+
+    # 验证分段计算得到的最新状态与全量一致
+    st_inc_128d = states_part2['128d']
+    assert st_128d.last_closed_bucket_id == st_inc_128d.last_closed_bucket_id
+    assert st_128d.bar_count == st_inc_128d.bar_count
+    assert np.isclose(st_128d.sk_closed, st_inc_128d.sk_closed)
+    assert np.isclose(st_128d.sd_closed, st_inc_128d.sd_closed)
+    assert np.isclose(st_128d.mk_closed, st_inc_128d.mk_closed)
+    assert np.isclose(st_128d.md_closed, st_inc_128d.md_closed)
+
+
+
 

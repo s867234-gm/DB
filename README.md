@@ -5,7 +5,7 @@
 [![Numba](https://img.shields.io/badge/Numba-JIT-orange.svg)](https://numba.pydata.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A 股全市场高频多周期快照时序数据库。基于 **DuckDB 列式存储引擎** 与 **Numba JIT 规则 A（动态快照 + 已闭合桶前值锚定）增量计算引擎**，覆盖沪深两市全部 **5,335 只标的**（5,228 只 A 股个股 + 107 只核心指数与通达信行业指数），支持日线（1d, 2d, 4d, 8d, 16d, 32d, 64d）与 15 分钟线（15m, 30m, 60m, 120m）共 11 个周期的实时 KDJ 指标平铺，并具备幂等增量自动同步能力。
+A 股全市场高频多周期快照时序数据库。基于 **DuckDB 列式存储引擎** 与 **Numba JIT 规则 A（动态快照 + 已闭合桶前值锚定）增量计算引擎**，覆盖沪深两市全部 **5,335 只标的**（5,228 只 A 股个股 + 107 只核心指数与通达信行业指数），支持日线（1d, 2d, 4d, 8d, 16d, 32d, 64d, 128d）与 15 分钟线（15m, 30m, 60m, 120m）共 12 个周期的实时 KDJ 指标平铺，并具备幂等增量自动同步能力。
 
 ---
 
@@ -71,8 +71,8 @@ D:\DB\
 │   ├── pilot_verify.py     # 阶段 2 核心样本指标与规则 A 核验脚本
 │   ├── run_phase3_full_build.py # 全量构建入口
 │   ├── run_daily_update.py # 日常增量更新命令行运行入口 (带进程互斥文件锁)
-│   ├── add_64d_period.py   # 64d 周期存量扩展与状态回填迁移脚本
-│   ├── add_turn10_and_liutongguben.py # liutongguben 与 turn10 扩展及存量回填脚本
+│   ├── add_128d_period.py  # 128d 周期存量扩展与状态回填迁移脚本
+│   ├── verify_128d.py      # 128d 周期数据完整性与增量计算精度核验脚本
 │   ├── verify_phase4.py    # 阶段 4 增量同步与全库体检核验脚本
 │   └── verify_full_db.py   # 全库数据质量核验与健康体检脚本
 ├── tests/
@@ -130,11 +130,11 @@ D:\DB\
 
 ### 3. 物理表 `daily_snapshot`（日线级多周期快照）
 - **主键**: `(symbol, trade_date)`
-- **覆盖周期**: `1d, 2d, 4d, 8d, 16d, 32d, 64d`（7 个周期平铺）
+- **覆盖周期**: `1d, 2d, 4d, 8d, 16d, 32d, 64d, 128d`（8 个周期平铺）
 - **前 12 列基础行情与换手指标**:
   - `symbol, code, trade_date, bar_seq, open, high, low, close, volume, amount, adj_factor, turn10`
   - `turn10`: 个股近 10 个实际交易日累计换手率（%），按 `SUM_10(volume_手) * 10000 / liutongguben` 计算（指数为 NULL）。
-- **后续 56 列指标**（每个周期包含 8 个指标：`sk, sd, skxl, sdxl, mk, md, mkxl, mdxl`）：
+- **后续 64 列指标**（每个周期包含 8 个指标：`sk, sd, skxl, sdxl, mk, md, mkxl, mdxl`）：
   - `sk_1d, sd_1d, skxl_1d, sdxl_1d, mk_1d, md_1d, mkxl_1d, mdxl_1d`
   - `sk_2d, sd_2d, skxl_2d, sdxl_2d, mk_2d, md_2d, mkxl_2d, mdxl_2d`
   - `sk_4d, sd_4d, skxl_4d, sdxl_4d, mk_4d, md_4d, mkxl_4d, mdxl_4d`
@@ -142,6 +142,7 @@ D:\DB\
   - `sk_16d, sd_16d, skxl_16d, sdxl_16d, mk_16d, md_16d, mkxl_16d, mdxl_16d`
   - `sk_32d, sd_32d, skxl_32d, sdxl_32d, mk_32d, md_32d, mkxl_32d, mdxl_32d`
   - `sk_64d, sd_64d, skxl_64d, sdxl_64d, mk_64d, md_64d, mkxl_64d, mdxl_64d`
+  - `sk_128d, sd_128d, skxl_128d, sdxl_128d, mk_128d, md_128d, mkxl_128d, mdxl_128d`
 
 ### 4. 物理表 `minute_snapshot`（15分钟级多周期快照）
 - **主键**: `(symbol, bar_end)`
@@ -155,15 +156,15 @@ D:\DB\
   - `sk_60m, sd_60m, skxl_60m, sdxl_60m, mk_60m, md_60m, mkxl_60m, mdxl_60m`
   - `sk_120m, sd_120m, skxl_120m, sdxl_120m, mk_120m, md_120m, mkxl_120m, mdxl_120m`
 
-### 5. 物理表 `incremental_state`（11 周期增量迭代中间状态）
+### 5. 物理表 `incremental_state`（12 周期增量迭代中间状态）
 - **主键**: `(symbol, period)`
-- **总行数**: 58,685 行（5,335 标的 × 11 周期，包含 7 个日线周期与 4 个分钟周期）
+- **总行数**: 64,020 行（5,335 标的 × 12 周期，包含 8 个日线周期与 4 个分钟周期）
 - **说明**: 存储每只标的在各个周期下最近闭合桶的高低点滚动窗口（JSON 数组）及闭合终值，确保增量更新无缝衔接历史序列。
 
 | 字段名 | 类型 | 说明 |
 | :--- | :--- | :--- |
 | `symbol` | VARCHAR | 标的代码 |
-| `period` | VARCHAR | 周期标识 (`1d`, `2d`, `4d`, `8d`, `16d`, `32d`, `64d`, `15m`, `30m`, `60m`, `120m`) |
+| `period` | VARCHAR | 周期标识 (`1d`, `2d`, `4d`, `8d`, `16d`, `32d`, `64d`, `128d`, `15m`, `30m`, `60m`, `120m`) |
 | `last_closed_bucket_id` | INTEGER | 最近已闭合桶序号 |
 | `closed_highs_adj` | VARCHAR | 最近 104 个已闭合桶前复权最高价 (JSON Array) |
 | `closed_lows_adj` | VARCHAR | 最近 104 个已闭合桶前复权最低价 (JSON Array) |
@@ -179,7 +180,7 @@ D:\DB\
 | `updated_at` | TIMESTAMP | 状态最后更新时间 |
 
 ### 6. 便捷视图 `v_daily_qfq` 与 `v_minute_qfq`
-基于 `daily_snapshot` 和 `minute_snapshot` 动态关联 `security_info`（`latest_adj_factor`、`liutongguben`），提供即开即用的前复权行情、`turn10` / `liutongguben` 及完整 56 / 32 列指标：
+基于 `daily_snapshot` 和 `minute_snapshot` 动态关联 `security_info`（`latest_adj_factor`、`liutongguben`），提供即开即用的前复权行情、`turn10` / `liutongguben` 及完整 64 / 32 列指标：
 - `open_qfq = open * adj_factor / latest_adj_factor`
 - `high_qfq = high * adj_factor / latest_adj_factor`
 - `low_qfq = low * adj_factor / latest_adj_factor`
@@ -259,15 +260,16 @@ SELECT
     sk_1d, sd_1d, skxl_1d,
     sk_4d, sd_4d, skxl_4d,
     sk_16d, sd_16d, skxl_16d,
-    sk_64d, sd_64d, skxl_64d
+    sk_64d, sd_64d, skxl_64d,
+    sk_128d, sd_128d, skxl_128d
 FROM v_daily_qfq
 WHERE symbol = 'SZ000001'
 ORDER BY trade_date DESC
 LIMIT 10;
 ```
 
-### 2. 11 周期 KDJ 共振金叉强势选股实战 SQL
-在量化多周期策略中，当**大周期处于上升趋势（多头向上）**且**中小周期同时出现金叉或斜率共振**时，通常代表极强的动量爆发点。以下 SQL 可直接在 DuckDB 中毫秒级筛选出日线（1d, 4d, 16d, 64d）与分钟线（15m, 60m）共振向上的标的：
+### 2. 12 周期 KDJ 共振金叉强势选股实战 SQL
+在量化多周期策略中，当**大周期处于上升趋势（多头向上）**且**中小周期同时出现金叉或斜率共振**时，通常代表极强的动量爆发点。以下 SQL 可直接在 DuckDB 中毫秒级筛选出日线（1d, 4d, 16d, 64d, 128d）与分钟线（15m, 60m）共振向上的标的：
 
 ```sql
 WITH latest_daily AS (
@@ -276,7 +278,8 @@ WITH latest_daily AS (
         sk_1d, sd_1d, skxl_1d,
         sk_4d, sd_4d, skxl_4d,
         sk_16d, sd_16d, skxl_16d,
-        sk_64d, sd_64d, skxl_64d
+        sk_64d, sd_64d, skxl_64d,
+        sk_128d, sd_128d, skxl_128d
     FROM daily_snapshot
     WHERE trade_date = (SELECT MAX(trade_date) FROM daily_snapshot)
 ),
@@ -302,6 +305,8 @@ SELECT
     ROUND(d.sk_16d, 2) AS sk_16d,
     ROUND(d.sk_64d, 2) AS sk_64d,
     ROUND(d.sd_64d, 2) AS sd_64d,
+    ROUND(d.sk_128d, 2) AS sk_128d,
+    ROUND(d.sd_128d, 2) AS sd_128d,
     -- 分钟指标
     ROUND(m.sk_15m, 2) AS sk_15m,
     ROUND(m.sk_60m, 2) AS sk_60m

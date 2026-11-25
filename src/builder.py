@@ -36,7 +36,7 @@ class FullMarketBuilder:
 
     def get_todo_symbols(self) -> List[Dict]:
         """
-        获取待构建标的列表 (支持断点续传: 自动跳过 incremental_state 中已满 11 个周期的标的)
+        获取待构建标的列表 (支持断点续传: 自动跳过 incremental_state 中已满 12 个周期的标的)
         """
         tgt_conn = duckdb.connect(self.db_path, read_only=True)
         # 1. 全部标的
@@ -46,13 +46,13 @@ class FullMarketBuilder:
             ORDER BY symbol ASC
         """).df()
 
-        # 2. 检查已完成标的 (满 11 个周期)
+        # 2. 检查已完成标的 (满 12 个周期)
         try:
             done_syms = set(tgt_conn.execute("""
                 SELECT symbol
                 FROM incremental_state
                 GROUP BY symbol
-                HAVING count(*) = 11
+                HAVING count(*) = 12
             """).df()['symbol'])
         except Exception:
             done_syms = set()

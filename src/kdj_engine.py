@@ -7,8 +7,8 @@ from typing import Dict, Tuple, List, Optional, Sequence
 from dataclasses import dataclass, asdict
 
 # 基础与指标列定义常量
-DAILY_PERIODS = [1, 2, 4, 8, 16, 32, 64]
-DAILY_PERIOD_NAMES = ['1d', '2d', '4d', '8d', '16d', '32d', '64d']
+DAILY_PERIODS = [1, 2, 4, 8, 16, 32, 64, 128]
+DAILY_PERIOD_NAMES = ['1d', '2d', '4d', '8d', '16d', '32d', '64d', '128d']
 
 MINUTE_PERIODS = [1, 2, 4, 8]  # 对应 slot 聚合步长: 1(15m), 2(30m), 4(60m), 8(120m)
 MINUTE_PERIOD_NAMES = ['15m', '30m', '60m', '120m']
@@ -363,7 +363,7 @@ class MultiCycleKDJEngine:
         liutongguben: Optional[float] = None,
     ) -> Tuple[pd.DataFrame, Dict[str, PeriodState]]:
         """
-        计算日线全历史 7 个周期 (1d, 2d, 4d, 8d, 16d, 32d, 64d) 快照、turn10 与最新状态
+        计算日线全历史 8 个周期 (1d, 2d, 4d, 8d, 16d, 32d, 64d, 128d) 快照、turn10 与最新状态
         """
         if df_daily.empty:
             return pd.DataFrame(columns=DAILY_SNAPSHOT_COLUMNS), (init_states or {})

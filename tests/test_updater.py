@@ -986,12 +986,12 @@ def test_on_demand_incremental_state_and_postmarket_xdxr_reuse(tmp_path, monkeyp
     assert res_intra["status"] == "SUCCESS"
     assert res_intra["minute_rows_added"] == 16
     assert mock_fetcher.fetch_xdxr_events.call_count == 1
-    # 断言：盘中仅写回 4 个分钟周期，绝不重写 7 个日线周期
+    # 断言：盘中仅写回 4 个分钟周期，绝不重写 8 个日线周期
     assert captured_periods[-1] == set(MINUTE_PERIOD_NAMES)
 
     con = duckdb.connect(db_file, read_only=True)
     d_state_ts = con.execute(
-        "SELECT DISTINCT updated_at FROM incremental_state WHERE symbol = 'SZ000001' AND period IN ('1d', '2d', '4d', '8d', '16d', '32d', '64d')"
+        "SELECT DISTINCT updated_at FROM incremental_state WHERE symbol = 'SZ000001' AND period IN ('1d', '2d', '4d', '8d', '16d', '32d', '64d', '128d')"
     ).fetchall()
     m_state_ts = con.execute(
         "SELECT DISTINCT updated_at FROM incremental_state WHERE symbol = 'SZ000001' AND period IN ('15m', '30m', '60m', '120m')"
@@ -1360,6 +1360,7 @@ def test_migration_add_turn10_and_liutongguben(tmp_path):
             sk_16d DOUBLE, sd_16d DOUBLE, skxl_16d DOUBLE, sdxl_16d DOUBLE, mk_16d DOUBLE, md_16d DOUBLE, mkxl_16d DOUBLE, mdxl_16d DOUBLE,
             sk_32d DOUBLE, sd_32d DOUBLE, skxl_32d DOUBLE, sdxl_32d DOUBLE, mk_32d DOUBLE, md_32d DOUBLE, mkxl_32d DOUBLE, mdxl_32d DOUBLE,
             sk_64d DOUBLE, sd_64d DOUBLE, skxl_64d DOUBLE, sdxl_64d DOUBLE, mk_64d DOUBLE, md_64d DOUBLE, mkxl_64d DOUBLE, mdxl_64d DOUBLE,
+            sk_128d DOUBLE, sd_128d DOUBLE, skxl_128d DOUBLE, sdxl_128d DOUBLE, mk_128d DOUBLE, md_128d DOUBLE, mkxl_128d DOUBLE, mdxl_128d DOUBLE,
             PRIMARY KEY (symbol, trade_date)
         );
         CREATE TABLE minute_snapshot (
