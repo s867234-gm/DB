@@ -14,6 +14,7 @@ import datetime
 import gc
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
@@ -41,6 +42,7 @@ from src.kdj_engine import (
     restore_state_from_db,
     states_to_df,
 )
+from src.schema import DEFAULT_DB_PATH
 
 logger = logging.getLogger("updater")
 
@@ -65,13 +67,15 @@ class DailyUpdater:
 
     def __init__(
         self,
-        db_path: str = r"D:\DB\A_DB.duckdb",
+        db_path: str = DEFAULT_DB_PATH,
         fetcher: Optional[TdxFetcher] = None,
         max_workers: int = 8,
     ):
         self.db_path = db_path
         self.fetcher = fetcher or TdxFetcher()
         self.max_workers = max_workers
+        self._xdxr_failed_intraday = set()
+        self._xdxr_lock = threading.Lock()
 
     def _connect_rw(self, retries: int = 5, delay: float = 2.0) -> duckdb.DuckDBPyConnection:
         """获取 DuckDB 读写连接，遇到文件锁冲突自动重试（最多 retries 次，每次间隔 delay 秒）"""
@@ -162,11 +166,14 @@ class DailyUpdater:
                 elif last_m == target_date and last_slot >= 16:
                     needs_minute = False
 
-            # 若标的已退市且数据已更新至退市日或之后，则不再产生更新任务
+            # 若标的已退市且数据已更新至退市日或之后，或当前已超过退市日 15 天（防长期停牌无效轮询），则不再产生更新任务
             delist_d = to_date(row.get("delist_date"))
-            if delist_d is not None and last_d is not None and last_d >= delist_d:
-                needs_daily = False
-                needs_minute = False
+            if delist_d is not None:
+                if (last_d is not None and last_d >= delist_d) or (
+                    target_date > delist_d + datetime.timedelta(days=15)
+                ):
+                    needs_daily = False
+                    needs_minute = False
 
             if needs_daily or needs_minute:
                 tasks.append({
@@ -262,9 +269,13 @@ class DailyUpdater:
         events = None
 
         if sec_type == "STOCK":
+            with self._xdxr_lock:
+                xdxr_failed_prev = (sym, target_date) in self._xdxr_failed_intraday
             # 判断是否可直接复用当日盘中已算好的复权因子（免去 15:32 盘后重复拉取 5,200+ 次除权接口）
+            # 若盘中除权接口曾拉取失败，盘后禁止跳过校验
             reuse_intraday_adj = (
-                not df_new_d.empty
+                not xdxr_failed_prev
+                and not df_new_d.empty
                 and len(df_new_d) == 1
                 and df_new_d.iloc[0]["trade_date"] == target_date
                 and last_m is not None
@@ -295,11 +306,23 @@ class DailyUpdater:
                     df_new_m["adj_factor"] = curr_adj
             elif not df_new_d.empty or has_intraday_preview:
                 events = self.fetcher.fetch_xdxr_events(sym)
+                if events is None:
+                    logger.warning(f"{sym} 除权事件拉取失败，跳过当日盘后复用信任")
+                    with self._xdxr_lock:
+                        self._xdxr_failed_intraday.add((sym, target_date))
+                    events_list = []
+                else:
+                    if xdxr_failed_prev:
+                        with self._xdxr_lock:
+                            self._xdxr_failed_intraday.discard((sym, target_date))
+                    events_list = events
+
                 event_by_date = {}
-                for e in events:
+                for e in events_list:
                     if e.get("category") == 1:
                         d_obj = datetime.date(e["year"], e["month"], e["day"])
                         event_by_date[d_obj] = e
+                sorted_events = sorted(event_by_date.items(), key=lambda x: x[0])
 
                 # 确定前收盘价基准 (优先使用上一交易日收盘价，次选新日线第一根 open)
                 prev_c = task.get("last_close")
@@ -307,33 +330,35 @@ class DailyUpdater:
                     if not df_new_d.empty:
                         prev_c = df_new_d.iloc[0]["open"]
 
-                # 1) 跑完截至 daily_target_date 的日线循环推进
+                # 1) 跑完截至 daily_target_date 的日线循环推进（区间匹配：覆盖停牌跨除权日场景）
+                prev_d_date = last_d
                 if not df_new_d.empty:
                     adj_list = []
                     for _, r in df_new_d.iterrows():
                         t_date = r["trade_date"]
-                        if t_date in event_by_date:
-                            ev = event_by_date[t_date]
-                            curr_adj = calculate_next_adj_factor(curr_adj, prev_c, ev)
-                            adj_factor_changed = True
-                            new_corp_actions.append({
-                                "symbol": sym,
-                                "event_date": t_date,
-                                "category": 1,
-                                "cash_dividend": float(ev.get("fenhong") or 0.0) / 10.0,
-                                "bonus_share": float(ev.get("songzhuangu") or 0.0) / 10.0,
-                                "rights_share": float(ev.get("peigu") or 0.0) / 10.0,
-                                "rights_price": float(ev.get("peigujia") or 0.0),
-                            })
+                        for ev_date, ev in sorted_events:
+                            if (prev_d_date is None or ev_date > prev_d_date) and ev_date <= t_date:
+                                curr_adj = calculate_next_adj_factor(curr_adj, prev_c, ev)
+                                adj_factor_changed = True
+                                new_corp_actions.append({
+                                    "symbol": sym,
+                                    "event_date": ev_date,
+                                    "category": 1,
+                                    "cash_dividend": float(ev.get("fenhong") or 0.0) / 10.0,
+                                    "bonus_share": float(ev.get("songzhuangu") or 0.0) / 10.0,
+                                    "rights_share": float(ev.get("peigu") or 0.0) / 10.0,
+                                    "rights_price": float(ev.get("peigujia") or 0.0),
+                                })
                         adj_by_date[t_date] = curr_adj
                         adj_list.append(curr_adj)
                         prev_c = r["close"]
+                        prev_d_date = t_date
                     df_new_d["adj_factor"] = adj_list
 
                 # 2) 盘中模式下的当日除权因子预演 (情况 A: 当日首次入库分钟线)：
                 # 检查在 (daily_target_date, target_date] 期间是否存在 category == 1 的除权除息记录
                 if has_intraday_preview:
-                    for ev_date, ev in sorted(event_by_date.items()):
+                    for ev_date, ev in sorted_events:
                         if daily_target_date is None or (ev_date > daily_target_date and ev_date <= target_date):
                             if prev_c is not None and prev_c > 0:
                                 intraday_adj = calculate_next_adj_factor(curr_adj, prev_c, ev)
@@ -514,6 +539,7 @@ class DailyUpdater:
                 )
                 con.unregister("tmp_batch_ca")
 
+            cn_now = get_cn_now()
             adj_updates = [
                 {"symbol": r["symbol"], "latest_adj_factor": r["latest_adj_factor"]}
                 for r in batch_results
@@ -526,10 +552,10 @@ class DailyUpdater:
                 con.register("tmp_batch_adj", df_adj_upd)
                 con.execute("""
                     UPDATE security_info s
-                    SET latest_adj_factor = u.latest_adj_factor, updated_at = NOW()
+                    SET latest_adj_factor = u.latest_adj_factor, updated_at = ?
                     FROM tmp_batch_adj u
                     WHERE s.symbol = u.symbol
-                """)
+                """, [cn_now])
                 con.unregister("tmp_batch_adj")
 
             ltgb_updates = [
@@ -544,10 +570,10 @@ class DailyUpdater:
                 con.register("tmp_batch_ltgb", df_ltgb_upd)
                 con.execute("""
                     UPDATE security_info s
-                    SET liutongguben = u.liutongguben, updated_at = NOW()
+                    SET liutongguben = u.liutongguben, updated_at = ?
                     FROM tmp_batch_ltgb u
                     WHERE s.symbol = u.symbol
-                """)
+                """, [cn_now])
                 con.unregister("tmp_batch_ltgb")
 
             con.execute("COMMIT;")
@@ -586,13 +612,11 @@ class DailyUpdater:
         # 1. 获取最新市场状态 (支持 get_latest_market_dates 与 get_latest_market_status 双向兼容)
         t_plan_start = time.perf_counter()
         use_market_dates = False
-        try:
+        if hasattr(self.fetcher, "get_latest_market_dates"):
             res_dates = self.fetcher.get_latest_market_dates(allow_intraday)
             if isinstance(res_dates, (tuple, list)) and len(res_dates) == 3:
                 daily_target_date, minute_target_date, is_closed = res_dates
                 use_market_dates = True
-        except Exception:
-            pass
 
         if not use_market_dates:
             target_date, is_closed = self.fetcher.get_latest_market_status(allow_intraday)

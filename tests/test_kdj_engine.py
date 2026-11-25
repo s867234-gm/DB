@@ -368,3 +368,33 @@ def test_turn10_calculation_and_incremental_continuity():
     assert np.isnan(df_zero_ltgb['turn10']).all()
 
 
+def test_closed_highs_overflow_truncation_guard():
+    """测试异常状态传入长度 > 104 的 closed_highs_adj / closed_lows_adj 时安全截断尾部 104 根不越界"""
+    df = generate_mock_daily_data(n_bars=10, seed=99)
+    long_highs = [10.0 + i * 0.1 for i in range(120)]
+    long_lows = [9.0 + i * 0.1 for i in range(120)]
+
+    st_overflow = PeriodState(
+        symbol='SZ000002', period='1d', last_closed_bucket_id=120,
+        closed_highs_adj=long_highs, closed_lows_adj=long_lows,
+        sk_closed=50.0, sd_closed=50.0, mk_closed=50.0, md_closed=50.0,
+        last_valid_rsv13=50.0, last_valid_rsv104=50.0,
+        bar_count=0, high_adj=None, low_adj=None,
+    )
+    st_tail104 = PeriodState(
+        symbol='SZ000002', period='1d', last_closed_bucket_id=120,
+        closed_highs_adj=long_highs[-104:], closed_lows_adj=long_lows[-104:],
+        sk_closed=50.0, sd_closed=50.0, mk_closed=50.0, md_closed=50.0,
+        last_valid_rsv13=50.0, last_valid_rsv104=50.0,
+        bar_count=0, high_adj=None, low_adj=None,
+    )
+
+    df_over, out_over = MultiCycleKDJEngine.compute_daily_snapshot(df, init_states={'1d': st_overflow})
+    df_tail, out_tail = MultiCycleKDJEngine.compute_daily_snapshot(df, init_states={'1d': st_tail104})
+
+    assert len(out_over['1d'].closed_highs_adj) == 104
+    np.testing.assert_allclose(df_over['sk_1d'].to_numpy(), df_tail['sk_1d'].to_numpy(), rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(df_over['mk_1d'].to_numpy(), df_tail['mk_1d'].to_numpy(), rtol=1e-12, atol=1e-12)
+
+
+

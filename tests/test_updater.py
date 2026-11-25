@@ -103,6 +103,26 @@ def test_parse_and_filter_bars():
     df_m_sub = parse_minute_bars_to_df("SZ000001", raw_m_sub)
     assert df_m_sub.iloc[0]["volume"] == 0.0
 
+    # 脏 OHLC bar（<=0、NaN、high < low）应被过滤，仅保留合法 K 线
+    raw_d_dirty = [
+        {"datetime": "2026-11-03", "open": 0.0, "high": 10.0, "low": 9.5, "close": 9.8, "vol": 1000, "amount": 9800},
+        {"datetime": "2026-11-04", "open": 10.0, "high": 9.0, "low": 10.5, "close": 10.0, "vol": 1000, "amount": 10000},
+        {"datetime": "2026-11-05", "open": float("nan"), "high": 10.5, "low": 9.5, "close": 10.0, "vol": 1000, "amount": 10000},
+        {"datetime": "2026-11-06", "open": 10.0, "high": 10.5, "low": 9.8, "close": 10.2, "vol": 1000, "amount": 10200},
+    ]
+    df_d_dirty = parse_daily_bars_to_df("SZ000001", raw_d_dirty)
+    assert len(df_d_dirty) == 1
+    assert df_d_dirty.iloc[0]["trade_date"] == datetime.date(2026, 11, 6)
+
+    raw_m_dirty = [
+        {"datetime": "2026-11-03 09:45", "open": -1.0, "high": 10.2, "low": 9.9, "close": 10.1, "vol": 100, "amount": 1010},
+        {"datetime": "2026-11-03 10:00", "open": 10.0, "high": 9.8, "low": 10.2, "close": 10.1, "vol": 100, "amount": 1010},
+        {"datetime": "2026-11-03 10:15", "open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "vol": 100, "amount": 1010},
+    ]
+    df_m_dirty = parse_minute_bars_to_df("SZ000001", raw_m_dirty)
+    assert len(df_m_dirty) == 1
+    assert df_m_dirty.iloc[0]["slot_seq"] == 3
+
 
 def test_updater_idempotence(tmp_path):
     """测试增量更新的幂等性：连续两次更新同一批数据，行数零增加且状态保持一致"""
@@ -1309,7 +1329,7 @@ def test_updater_liutongguben_and_turn10_incremental_persistence(tmp_path):
 
 def test_migration_add_turn10_and_liutongguben(tmp_path):
     """测试迁移脚本对老旧库升级 schema/views、v1 历史对齐、未覆盖行补算与幂等重跑"""
-    from scripts.add_turn10_and_liutongguben import backfill_turn10, upgrade_schema_and_views
+    from scripts.archive.add_turn10_and_liutongguben import backfill_turn10, upgrade_schema_and_views
 
     db_file = str(tmp_path / "legacy_adb.duckdb")
     v1_file = str(tmp_path / "mock_v1.duckdb")
@@ -1509,7 +1529,7 @@ def test_extract_liutongguben_from_xdxr_and_fallbacks(tmp_path, monkeypatch):
     assert np.isclose(turn10_saved, 0.3)
 
     # 4. 测试 populate_liutongguben 三级兜底（v1 turn10 反推）与 backfill_turn10 对 v1 NULL/NaN 自动补算
-    from scripts.add_turn10_and_liutongguben import backfill_turn10, populate_liutongguben
+    from scripts.archive.add_turn10_and_liutongguben import backfill_turn10, populate_liutongguben
 
     db_mig = str(tmp_path / "test_tier3_mig.duckdb")
     v1_mig = str(tmp_path / "test_tier3_v1.duckdb")
@@ -1549,7 +1569,7 @@ def test_extract_liutongguben_from_xdxr_and_fallbacks(tmp_path, monkeypatch):
         def fetch_xdxr_events(self, sym):
             return []
 
-    monkeypatch.setattr("scripts.add_turn10_and_liutongguben.TdxFetcher", EmptyTdxFetcher)
+    monkeypatch.setattr("scripts.archive.add_turn10_and_liutongguben.TdxFetcher", EmptyTdxFetcher)
     total_cnt, upd_cnt = populate_liutongguben(
         con_m, workers=1, only_missing=True, source_db_path=v1_mig
     )
@@ -1582,6 +1602,87 @@ def test_extract_liutongguben_from_xdxr_and_fallbacks(tmp_path, monkeypatch):
     ).fetchone()[0]
     con_m.close()
     assert sub_t10 is None
+
+
+def test_suspended_across_ex_dividend_and_intraday_xdxr_fail(tmp_path):
+    """测试停牌跨除权日复权因子区间累乘，以及盘中除权接口失败时盘后禁止盲目复用"""
+    db_file = str(tmp_path / "test_suspend_xdxr.duckdb")
+    con = duckdb.connect(db_file)
+    create_tables(con)
+    con.execute("""
+        INSERT INTO security_info (symbol, code, name, sec_type, exchange, board, latest_adj_factor)
+        VALUES ('SZ000001', '000001', '平安银行', 'STOCK', 'SZSE', 'MAIN', 1.0)
+    """)
+    # 最后已入库日线为 2026-10-14 (close=10.0, adj_factor=1.0)
+    df_init, st_init = MultiCycleKDJEngine.compute_daily_snapshot(pd.DataFrame([{
+        "symbol": "SZ000001", "code": "000001", "trade_date": datetime.date(2026, 10, 14),
+        "bar_seq": 0, "open": 10.0, "high": 10.2, "low": 9.8, "close": 10.0,
+        "volume": 1000.0, "amount": 10000.0, "adj_factor": 1.0,
+    }]))
+    con.register("tmp_d", df_init)
+    con.execute("INSERT INTO daily_snapshot BY NAME SELECT * FROM tmp_d")
+    con.register("tmp_s", states_to_df(list(st_init.values())))
+    con.execute("INSERT INTO incremental_state BY NAME SELECT * FROM tmp_s")
+    con.close()
+
+    # 1. 2026-10-15 停牌遇每 10 股派 20 元分红 (prev_close=10 -> ref=8 -> factor=1.25)，10-16 复牌
+    d_target = datetime.date(2026, 10, 16)
+    mock_fetcher = MagicMock()
+    mock_fetcher.get_latest_market_dates.return_value = (d_target, d_target, True)
+    mock_fetcher.get_latest_market_status.return_value = (d_target, True)
+    mock_fetcher.fetch_daily_bars.return_value = [{
+        "datetime": "2026-10-16", "open": 8.0, "high": 8.4, "low": 7.9,
+        "close": 8.2, "vol": 200000, "amount": 1640000,
+    }]
+    mock_fetcher.fetch_minute_bars.return_value = []
+    mock_fetcher.fetch_finance_info.return_value = None
+    mock_fetcher.fetch_xdxr_events.return_value = [
+        {"year": 2026, "month": 10, "day": 15, "category": 1, "fenhong": 20.0, "songzhuangu": 0.0, "peigu": 0.0, "peigujia": 0.0}
+    ]
+
+    updater = DailyUpdater(db_path=db_file, fetcher=mock_fetcher)
+    res = updater.run_update(allow_intraday=False)
+    assert res["status"] == "SUCCESS"
+
+    con = duckdb.connect(db_file, read_only=True)
+    row = con.execute("SELECT adj_factor FROM daily_snapshot WHERE symbol='SZ000001' AND trade_date='2026-10-16'").fetchone()
+    ca_cnt = con.execute("SELECT COUNT(*) FROM corporate_action WHERE symbol='SZ000001' AND event_date='2026-10-15'").fetchone()[0]
+    con.close()
+    assert pytest.approx(row[0], 1e-6) == 1.25
+    assert ca_cnt == 1
+
+    # 2. 盘中 fetch_xdxr_events 返回 None（失败）后，同实例盘后不得信任 last_m_adj，必须重新拉取除权事件
+    d_intra = datetime.date(2026, 10, 19)
+    mock_fetcher.get_latest_market_dates.return_value = (datetime.date(2026, 10, 16), d_intra, False)
+    mock_fetcher.fetch_daily_bars.return_value = []
+    mock_fetcher.fetch_minute_bars.return_value = [{
+        "datetime": "2026-10-19 09:45", "open": 8.2, "high": 8.3, "low": 8.1, "close": 8.2, "vol": 1000, "amount": 8200
+    }]
+    mock_fetcher.fetch_xdxr_events.return_value = None
+
+    res_intra = updater.run_update(allow_intraday=True)
+    assert res_intra["status"] == "SUCCESS"
+    assert ("SZ000001", d_intra) in updater._xdxr_failed_intraday
+
+    # 盘后恢复返回真实除权（10-19 每10股送10股 -> factor翻倍为 2.5）
+    mock_fetcher.get_latest_market_dates.return_value = (d_intra, d_intra, True)
+    mock_fetcher.fetch_daily_bars.return_value = [{
+        "datetime": "2026-10-19", "open": 4.1, "high": 4.2, "low": 4.0, "close": 4.1, "vol": 200000, "amount": 820000
+    }]
+    mock_fetcher.fetch_minute_bars.return_value = []
+    mock_fetcher.fetch_xdxr_events.reset_mock()
+    mock_fetcher.fetch_xdxr_events.return_value = [
+        {"year": 2026, "month": 10, "day": 19, "category": 1, "fenhong": 0.0, "songzhuangu": 10.0, "peigu": 0.0, "peigujia": 0.0}
+    ]
+    res_post = updater.run_update(allow_intraday=False)
+    assert res_post["status"] == "SUCCESS"
+    assert mock_fetcher.fetch_xdxr_events.call_count == 1
+
+    con = duckdb.connect(db_file, read_only=True)
+    adj_19 = con.execute("SELECT adj_factor FROM daily_snapshot WHERE symbol='SZ000001' AND trade_date='2026-10-19'").fetchone()[0]
+    con.close()
+    assert pytest.approx(adj_19, 1e-6) == 2.5
+
 
 
 

@@ -15,8 +15,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.kdj_engine import MultiCycleKDJEngine
-
-DEFAULT_DB_PATH = r"D:\DB\A_DB.duckdb"
+from src.schema import DEFAULT_DB_PATH
 
 
 def main(db_path: str = DEFAULT_DB_PATH):

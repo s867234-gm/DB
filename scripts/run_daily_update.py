@@ -17,63 +17,19 @@ import os
 import sys
 import time
 
-try:
-    import msvcrt
-except ImportError:
-    msvcrt = None
-
 # 确保项目根目录在 sys.path 中
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+from src.lock import SingleInstanceLock
+from src.schema import DEFAULT_DB_PATH
 from src.updater import DailyUpdater
 
 
-class SingleInstanceLock:
-    """跨进程单实例互斥文件锁（基于 Windows msvcrt.locking）"""
-
-    def __init__(self, lock_file_path: str):
-        self.lock_file_path = lock_file_path
-        self.handle = None
-
-    def acquire(self) -> bool:
-        if msvcrt is None:
-            return True
-        os.makedirs(os.path.dirname(self.lock_file_path), exist_ok=True)
-        try:
-            self.handle = open(self.lock_file_path, "a+")
-            self.handle.seek(0)
-            msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
-            self.handle.truncate(0)
-            self.handle.write(f"{os.getpid()}\n")
-            self.handle.flush()
-            return True
-        except (IOError, OSError):
-            if self.handle:
-                try:
-                    self.handle.close()
-                except Exception:
-                    pass
-                self.handle = None
-            return False
-
-    def release(self):
-        if self.handle:
-            try:
-                self.handle.seek(0)
-                if msvcrt:
-                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
-            except Exception:
-                pass
-            try:
-                self.handle.close()
-            except Exception:
-                pass
-            self.handle = None
-
-
-def setup_logger(log_dir: str = "logs"):
+def setup_logger(log_dir: str = None):
+    if log_dir is None:
+        log_dir = os.path.join(project_root, "logs")
     os.makedirs(log_dir, exist_ok=True)
     today_str = datetime.date.today().strftime("%Y%m%d")
     log_file = os.path.join(log_dir, f"update_{today_str}.log")
@@ -94,7 +50,7 @@ def main():
     parser.add_argument(
         "--db-path",
         type=str,
-        default=r"D:\DB\A_DB.duckdb",
+        default=DEFAULT_DB_PATH,
         help="目标 DuckDB 数据库路径",
     )
     parser.add_argument(

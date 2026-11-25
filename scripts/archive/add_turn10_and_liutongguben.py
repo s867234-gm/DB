@@ -26,12 +26,7 @@ from typing import Dict, List, Optional, Tuple
 import duckdb
 import pandas as pd
 
-try:
-    import msvcrt
-except ImportError:
-    msvcrt = None
-
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
@@ -39,7 +34,9 @@ from src.fetcher import (
     TdxFetcher,
     extract_liutongguben,
     extract_liutongguben_from_xdxr,
+    get_cn_now,
 )
+from src.lock import SingleInstanceLock
 from src.schema import DEFAULT_DB_PATH, SOURCE_DB_PATH, VIEWS_DDL
 
 DEFAULT_LOCK_PATH = os.path.join(project_root, "logs", "update.lock")
@@ -51,49 +48,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("add_turn10_and_liutongguben")
-
-
-class SingleInstanceLock:
-    """跨进程单实例互斥文件锁（基于 Windows msvcrt.locking）"""
-
-    def __init__(self, lock_file_path: str):
-        self.lock_file_path = lock_file_path
-        self.handle = None
-
-    def acquire(self) -> bool:
-        if msvcrt is None:
-            return True
-        os.makedirs(os.path.dirname(self.lock_file_path), exist_ok=True)
-        try:
-            self.handle = open(self.lock_file_path, "a+")
-            self.handle.seek(0)
-            msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
-            self.handle.truncate(0)
-            self.handle.write(f"{os.getpid()}\n")
-            self.handle.flush()
-            return True
-        except (IOError, OSError):
-            if self.handle:
-                try:
-                    self.handle.close()
-                except Exception:
-                    pass
-                self.handle = None
-            return False
-
-    def release(self):
-        if self.handle:
-            try:
-                self.handle.seek(0)
-                if msvcrt:
-                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
-            except Exception:
-                pass
-            try:
-                self.handle.close()
-            except Exception:
-                pass
-            self.handle = None
 
 
 def upgrade_schema_and_views(con: duckdb.DuckDBPyConnection) -> None:
@@ -263,10 +217,10 @@ def populate_liutongguben(
         con.register("tmp_ltgb_upd", df_upd)
         con.execute("""
             UPDATE security_info s
-            SET liutongguben = u.liutongguben, updated_at = NOW()
+            SET liutongguben = u.liutongguben, updated_at = ?
             FROM tmp_ltgb_upd u
             WHERE s.symbol = u.symbol
-        """)
+        """, [get_cn_now()])
         con.unregister("tmp_ltgb_upd")
 
     # 严格确保指数不含 liutongguben

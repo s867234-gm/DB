@@ -19,21 +19,16 @@ import numpy as np
 import pandas as pd
 import duckdb
 
-try:
-    import msvcrt
-except ImportError:
-    msvcrt = None
-
 # 确保项目根目录在 sys.path 中
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from src.schema import VIEWS_DDL
+from src.lock import SingleInstanceLock
+from src.schema import DEFAULT_DB_PATH, VIEWS_DDL
 from src.kdj_engine import PeriodState, states_to_df, _compute_period_kdj_numba
 from src.fetcher import get_cn_now
 
-DEFAULT_DB_PATH = r"D:\DB\A_DB.duckdb"
 DEFAULT_LOCK_PATH = os.path.join(project_root, "logs", "update.lock")
 BATCH_SIZE = 500
 
@@ -43,49 +38,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("add_64d_period")
-
-
-class SingleInstanceLock:
-    """跨进程单实例互斥文件锁（基于 Windows msvcrt.locking）"""
-
-    def __init__(self, lock_file_path: str):
-        self.lock_file_path = lock_file_path
-        self.handle = None
-
-    def acquire(self) -> bool:
-        if msvcrt is None:
-            return True
-        os.makedirs(os.path.dirname(self.lock_file_path), exist_ok=True)
-        try:
-            self.handle = open(self.lock_file_path, "a+")
-            self.handle.seek(0)
-            msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
-            self.handle.truncate(0)
-            self.handle.write(f"{os.getpid()}\n")
-            self.handle.flush()
-            return True
-        except (IOError, OSError):
-            if self.handle:
-                try:
-                    self.handle.close()
-                except Exception:
-                    pass
-                self.handle = None
-            return False
-
-    def release(self):
-        if self.handle:
-            try:
-                self.handle.seek(0)
-                if msvcrt:
-                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
-            except Exception:
-                pass
-            try:
-                self.handle.close()
-            except Exception:
-                pass
-            self.handle = None
 
 
 def upgrade_schema_and_views(con: duckdb.DuckDBPyConnection) -> None:

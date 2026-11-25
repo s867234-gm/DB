@@ -62,6 +62,13 @@ def test_views_qfq_calculation():
     assert len(df_m) == 1
     assert pytest.approx(df_m.iloc[0]["close_qfq"], 1e-4) == 5.0
     assert pytest.approx(df_m.iloc[0]["open_qfq"], 1e-4) == 4.5
+
+    # 验证 latest_adj_factor = 0 时视图不抛除零异常且安全返回 NULL
+    con.execute("UPDATE security_info SET latest_adj_factor = 0.0 WHERE symbol = 'SH600000'")
+    df_d_zero = con.execute("SELECT open_qfq, close_qfq FROM v_daily_qfq WHERE symbol = 'SH600000'").df()
+    df_m_zero = con.execute("SELECT open_qfq, close_qfq FROM v_minute_qfq WHERE symbol = 'SH600000'").df()
+    assert pd.isna(df_d_zero.iloc[0]["open_qfq"]) and pd.isna(df_d_zero.iloc[0]["close_qfq"])
+    assert pd.isna(df_m_zero.iloc[0]["open_qfq"]) and pd.isna(df_m_zero.iloc[0]["close_qfq"])
     con.close()
 
 

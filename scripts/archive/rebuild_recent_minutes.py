@@ -8,6 +8,7 @@ scripts/rebuild_recent_minutes.py —— 2026-10-30 干净基准锚点回溯重�
 3. 一次性重算 4 个交易日的分钟线快照，原子事务写入 minute_snapshot，并校正 incremental_state (带当前时间戳 updated_at)。
 """
 
+import argparse
 import os
 import sys
 import time
@@ -19,12 +20,13 @@ from typing import Dict, List, Tuple
 import duckdb
 import pandas as pd
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.fetcher import TdxFetcher, parse_minute_bars_to_df
 from src.kdj_engine import MultiCycleKDJEngine, PeriodState, MINUTE_PERIOD_NAMES, states_to_df
+from src.schema import DEFAULT_DB_PATH
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +34,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rebuild_minutes")
 
-DB_PATH = r"D:\DB\A_DB.duckdb"
+DB_PATH = DEFAULT_DB_PATH
 REBUILD_START_DATE = datetime.date(2026, 11, 2)
 BASELINE_END_DATE = datetime.date(2026, 10, 30)
 HIST_LOOKBACK_START = datetime.date(2026, 7, 15)
@@ -166,6 +168,20 @@ def process_symbol_task(
 
 
 def main():
+    parser = argparse.ArgumentParser(description="A_DB 2026-11-02 ~ 2026-11-05 分钟线历史回溯重建脚本")
+    parser.add_argument(
+        "--confirm-rebuild",
+        action="store_true",
+        help="显式确认执行历史分钟线 DELETE 与重算写入（防误触保护）",
+    )
+    args = parser.parse_args()
+    if not args.confirm_rebuild:
+        print(
+            "[安全拦截] 本脚本将 DELETE 并重写 2026-11-02 以来的 minute_snapshot 与 incremental_state！\n"
+            "如确需执行，请显式传入: python scripts/archive/rebuild_recent_minutes.py --confirm-rebuild"
+        )
+        sys.exit(1)
+
     start_time = time.time()
     logger.info("==================================================")
     logger.info("  A_DB 2026-11-02 ~ 2026-11-05 分钟线精密回溯重建")

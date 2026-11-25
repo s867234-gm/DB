@@ -15,10 +15,11 @@ if project_root not in sys.path:
 import duckdb
 import pandas as pd
 
+from src.schema import DEFAULT_DB_PATH
 from src.updater import DailyUpdater
 
-DB_PATH = r"D:\DB\A_DB.duckdb"
-REPORT_PATH = r"D:\DB\docs\phase4_update_report.md"
+DB_PATH = DEFAULT_DB_PATH
+REPORT_PATH = os.path.join(project_root, "docs", "phase4_update_report.md")
 
 
 def run_verification():

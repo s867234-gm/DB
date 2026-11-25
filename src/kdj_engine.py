@@ -139,7 +139,7 @@ def states_to_df(states: List[PeriodState], updated_at=None) -> pd.DataFrame:
 
 
 
-@nb.njit(fastmath=True)
+@nb.njit
 def _compute_period_kdj_numba(
     high_adj: np.ndarray,
     low_adj: np.ndarray,
@@ -168,10 +168,11 @@ def _compute_period_kdj_numba(
     closed_lows = np.empty(104, dtype=np.float64)
     
     n_init = len(init_closed_highs)
+    start = max(0, n_init - 104)
     k_closed = 0
-    for i in range(n_init):
-        closed_highs[i] = init_closed_highs[i]
-        closed_lows[i] = init_closed_lows[i]
+    for i in range(start, n_init):
+        closed_highs[k_closed] = init_closed_highs[i]
+        closed_lows[k_closed] = init_closed_lows[i]
         k_closed += 1
 
     sk_closed = init_sk_closed

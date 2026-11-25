@@ -14,6 +14,7 @@ from src.schema import DEFAULT_DB_PATH, SOURCE_DB_PATH, init_database
 from src.fetcher import extract_liutongguben
 from src.kdj_engine import (
     MultiCycleKDJEngine, PeriodState,
+    DAILY_PERIOD_NAMES, MINUTE_PERIOD_NAMES,
     DAILY_SNAPSHOT_COLUMNS, MINUTE_SNAPSHOT_COLUMNS
 )
 
@@ -103,6 +104,9 @@ class FullMarketBuilder:
             latest_adj = float(df_d_sym['adj_factor'].iloc[-1])
             for st in d_states.values():
                 inc_rows.append(st.to_db_row(updated_at=now_ts))
+        else:
+            for p in DAILY_PERIOD_NAMES:
+                inc_rows.append(PeriodState.initial(sym, p).to_db_row(updated_at=now_ts))
 
         # 2. 计算分钟线 (预热并截取 >= 2024-10-01)
         if df_m_sym is not None and len(df_m_sym) > 0:
@@ -112,6 +116,9 @@ class FullMarketBuilder:
             )
             for st in m_states.values():
                 inc_rows.append(st.to_db_row(updated_at=now_ts))
+        else:
+            for p in MINUTE_PERIOD_NAMES:
+                inc_rows.append(PeriodState.initial(sym, p).to_db_row(updated_at=now_ts))
 
         return d_snap_df, m_snap_df, inc_rows, latest_adj
 
@@ -201,55 +208,61 @@ class FullMarketBuilder:
         # ------------------------------------------------------------------
         t0 = time.perf_counter()
         tgt_conn.execute("BEGIN TRANSACTION")
+        try:
+            # 1. 批量写入 daily_snapshot (新标的使用 IGNORE 或普通 INSERT 避免昂贵的唯一冲突扫描)
+            if d_snap_list:
+                batch_daily_df = pd.concat(d_snap_list, ignore_index=True)
+                tgt_conn.register("df_batch_daily", batch_daily_df)
+                tgt_conn.execute("INSERT OR IGNORE INTO daily_snapshot BY NAME SELECT * FROM df_batch_daily")
+                tgt_conn.unregister("df_batch_daily")
+                d_rows = len(batch_daily_df)
+                del batch_daily_df
+            else:
+                d_rows = 0
 
-        # 1. 批量写入 daily_snapshot (新标的使用 IGNORE 或普通 INSERT 避免昂贵的唯一冲突扫描)
-        if d_snap_list:
-            batch_daily_df = pd.concat(d_snap_list, ignore_index=True)
-            tgt_conn.register("df_batch_daily", batch_daily_df)
-            tgt_conn.execute("INSERT OR IGNORE INTO daily_snapshot BY NAME SELECT * FROM df_batch_daily")
-            tgt_conn.unregister("df_batch_daily")
-            d_rows = len(batch_daily_df)
-            del batch_daily_df
-        else:
-            d_rows = 0
+            # 2. 批量写入 minute_snapshot
+            if m_snap_list:
+                batch_min_df = pd.concat(m_snap_list, ignore_index=True)
+                tgt_conn.register("df_batch_min", batch_min_df)
+                tgt_conn.execute("INSERT OR IGNORE INTO minute_snapshot BY NAME SELECT * FROM df_batch_min")
+                tgt_conn.unregister("df_batch_min")
+                m_rows = len(batch_min_df)
+                del batch_min_df
+            else:
+                m_rows = 0
 
-        # 2. 批量写入 minute_snapshot
-        if m_snap_list:
-            batch_min_df = pd.concat(m_snap_list, ignore_index=True)
-            tgt_conn.register("df_batch_min", batch_min_df)
-            tgt_conn.execute("INSERT OR IGNORE INTO minute_snapshot BY NAME SELECT * FROM df_batch_min")
-            tgt_conn.unregister("df_batch_min")
-            m_rows = len(batch_min_df)
-            del batch_min_df
-        else:
-            m_rows = 0
+            # 3. 批量写入 incremental_state
+            if all_inc_rows:
+                batch_inc_df = pd.DataFrame(all_inc_rows, columns=[
+                    'symbol', 'period', 'last_closed_bucket_id', 'closed_highs_adj', 'closed_lows_adj',
+                    'sk_closed', 'sd_closed', 'mk_closed', 'md_closed', 'last_valid_rsv13', 'last_valid_rsv104',
+                    'bar_count', 'high_adj', 'low_adj', 'updated_at'
+                ])
+                tgt_conn.register("df_batch_inc", batch_inc_df)
+                tgt_conn.execute("INSERT OR REPLACE INTO incremental_state BY NAME SELECT * FROM df_batch_inc")
+                tgt_conn.unregister("df_batch_inc")
+                del batch_inc_df
 
-        # 3. 批量写入 incremental_state
-        if all_inc_rows:
-            batch_inc_df = pd.DataFrame(all_inc_rows, columns=[
-                'symbol', 'period', 'last_closed_bucket_id', 'closed_highs_adj', 'closed_lows_adj',
-                'sk_closed', 'sd_closed', 'mk_closed', 'md_closed', 'last_valid_rsv13', 'last_valid_rsv104',
-                'bar_count', 'high_adj', 'low_adj', 'updated_at'
-            ])
-            tgt_conn.register("df_batch_inc", batch_inc_df)
-            tgt_conn.execute("INSERT OR REPLACE INTO incremental_state BY NAME SELECT * FROM df_batch_inc")
-            tgt_conn.unregister("df_batch_inc")
-            del batch_inc_df
+            # 4. 批量更新 security_info.latest_adj_factor
+            if latest_adj_updates:
+                df_adj_upd = pd.DataFrame(latest_adj_updates, columns=['latest_adj_factor', 'symbol'])
+                tgt_conn.register("df_adj_upd", df_adj_upd)
+                tgt_conn.execute("""
+                    UPDATE security_info s
+                    SET latest_adj_factor = u.latest_adj_factor
+                    FROM df_adj_upd u
+                    WHERE s.symbol = u.symbol
+                """)
+                tgt_conn.unregister("df_adj_upd")
+                del df_adj_upd
 
-        # 4. 批量更新 security_info.latest_adj_factor
-        if latest_adj_updates:
-            df_adj_upd = pd.DataFrame(latest_adj_updates, columns=['latest_adj_factor', 'symbol'])
-            tgt_conn.register("df_adj_upd", df_adj_upd)
-            tgt_conn.execute("""
-                UPDATE security_info s
-                SET latest_adj_factor = u.latest_adj_factor
-                FROM df_adj_upd u
-                WHERE s.symbol = u.symbol
-            """)
-            tgt_conn.unregister("df_adj_upd")
-            del df_adj_upd
-
-        tgt_conn.execute("COMMIT")
+            tgt_conn.execute("COMMIT")
+        except Exception:
+            try:
+                tgt_conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         t_write = time.perf_counter() - t0
         t_total = time.perf_counter() - t_start
 

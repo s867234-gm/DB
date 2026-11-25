@@ -112,8 +112,6 @@ class TdxConnectionPool:
 
     _instance = None
     _lock = threading.Lock()
-    _rr_counter = 0
-    _rr_lock = threading.Lock()
 
     def __init__(self, servers=None):
         self._all_servers: List[Tuple[str, int, str]] = list(servers or BACKUP_SERVERS)
@@ -331,10 +329,12 @@ class TdxConnectionPool:
         """获取当前线程绑定的可用 TdxHq_API 实例，失败时自动故障切换"""
         if hasattr(self._local, "api") and self._local.api is not None:
             curr_srv = getattr(self._local, "server", None)
-            if (
-                getattr(self._local, "epoch", -1) != self._pool_epoch
-                or curr_srv not in self.servers
-            ):
+            with self._rr_lock:
+                stale_or_evicted = (
+                    getattr(self._local, "epoch", -1) != self._pool_epoch
+                    or curr_srv not in self.servers
+                )
+            if stale_or_evicted:
                 self.disconnect_thread()
             else:
                 # 简单心跳验证
@@ -481,6 +481,49 @@ class TdxFetcher:
         _, minute_target_date, is_closed = self.get_latest_market_dates(allow_intraday)
         return minute_target_date, is_closed
 
+    def _call_with_retry(
+        self,
+        symbol: str,
+        tag: str,
+        action_desc: str,
+        rpc_fn,
+        *,
+        penalize_none: bool = True,
+        require_dict: bool = False,
+        default_on_fail=None,
+    ):
+        """公共 RPC 重试与节点健康度记账辅助方法"""
+        for retry in range(2):
+            curr_server = None
+            try:
+                api = self.pool.get_client()
+                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
+                t_rpc = time.perf_counter()
+                res = rpc_fn(api)
+                rpc_elapsed = time.perf_counter() - t_rpc
+                is_slow = rpc_elapsed > 1.8
+                if is_slow and hasattr(self.pool, "record_server_error"):
+                    self.pool.record_server_error(curr_server, f"{tag}_slow:{rpc_elapsed:.2f}s")
+                is_invalid = (res is None) or (require_dict and not isinstance(res, dict))
+                if is_invalid:
+                    if penalize_none and hasattr(self.pool, "record_server_error"):
+                        self.pool.record_server_error(curr_server, f"{tag}_none")
+                    if penalize_none or is_slow or retry == 0:
+                        self.pool.disconnect_thread()
+                    if retry == 0:
+                        continue
+                    return default_on_fail
+                return res
+            except Exception as e:
+                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
+                if hasattr(self.pool, "record_server_error"):
+                    self.pool.record_server_error(curr_server, f"{tag}_exc:{type(e).__name__}")
+                self.pool.disconnect_thread()
+                if retry == 1:
+                    logger.warning(f"{symbol} {action_desc}失败: {e}")
+                    return default_on_fail
+        return default_on_fail
+
     def fetch_daily_bars(
         self, symbol: str, sec_type: str, offset: int = 15
     ) -> List[Dict]:
@@ -488,37 +531,19 @@ class TdxFetcher:
         返回原始 dict 列表，字段包含 open, high, low, close, vol, amount, datetime 等
         """
         market, code, is_idx = parse_symbol(symbol)
-        for retry in range(2):
-            curr_server = None
-            try:
-                api = self.pool.get_client()
-                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
-                t_rpc = time.perf_counter()
-                if is_idx or sec_type in ("BROAD_INDEX", "INDUSTRY_INDEX"):
-                    bars = api.get_index_bars(4, market, code, 0, offset)
-                else:
-                    bars = api.get_security_bars(4, market, code, 0, offset)
-                rpc_elapsed = time.perf_counter() - t_rpc
-                if rpc_elapsed > 1.8 and hasattr(self.pool, "record_server_error"):
-                    self.pool.record_server_error(curr_server, f"daily_slow:{rpc_elapsed:.2f}s")
-                if bars is None:
-                    if hasattr(self.pool, "record_server_error"):
-                        self.pool.record_server_error(curr_server, "daily_none")
-                    self.pool.disconnect_thread()
-                    if retry == 0:
-                        continue
-                    return []
-                # 返回空列表 [] 且未抛异常时（如停牌或暂无数据），保持健康连接直接返回
-                return bars
-            except Exception as e:
-                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
-                if hasattr(self.pool, "record_server_error"):
-                    self.pool.record_server_error(curr_server, f"daily_exc:{type(e).__name__}")
-                self.pool.disconnect_thread()
-                if retry == 1:
-                    logger.warning(f"{symbol} 拉取日线失败")
-                    return []
-        return []
+        is_index = is_idx or sec_type in ("BROAD_INDEX", "INDUSTRY_INDEX")
+        return self._call_with_retry(
+            symbol,
+            "daily",
+            "拉取日线",
+            lambda api: (
+                api.get_index_bars(4, market, code, 0, offset)
+                if is_index
+                else api.get_security_bars(4, market, code, 0, offset)
+            ),
+            penalize_none=True,
+            default_on_fail=[],
+        )
 
     def fetch_minute_bars(
         self, symbol: str, sec_type: str, offset: int = 48
@@ -527,106 +552,48 @@ class TdxFetcher:
         通达信 category: 1 为 15 分钟线
         """
         market, code, is_idx = parse_symbol(symbol)
-        for retry in range(2):
-            curr_server = None
-            try:
-                api = self.pool.get_client()
-                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
-                t_rpc = time.perf_counter()
-                if is_idx or sec_type in ("BROAD_INDEX", "INDUSTRY_INDEX"):
-                    bars = api.get_index_bars(1, market, code, 0, offset)
-                else:
-                    bars = api.get_security_bars(1, market, code, 0, offset)
-                rpc_elapsed = time.perf_counter() - t_rpc
-                if rpc_elapsed > 1.8 and hasattr(self.pool, "record_server_error"):
-                    self.pool.record_server_error(curr_server, f"min15_slow:{rpc_elapsed:.2f}s")
-                if bars is None:
-                    if hasattr(self.pool, "record_server_error"):
-                        self.pool.record_server_error(curr_server, "min15_none")
-                    self.pool.disconnect_thread()
-                    if retry == 0:
-                        continue
-                    return []
-                # 返回空列表 [] 且未抛异常时（如停牌或暂无数据），保持健康连接直接返回
-                return bars
-            except Exception as e:
-                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
-                if hasattr(self.pool, "record_server_error"):
-                    self.pool.record_server_error(curr_server, f"min15_exc:{type(e).__name__}")
-                self.pool.disconnect_thread()
-                if retry == 1:
-                    logger.warning(f"{symbol} 拉取分钟线失败")
-                    return []
-        return []
+        is_index = is_idx or sec_type in ("BROAD_INDEX", "INDUSTRY_INDEX")
+        return self._call_with_retry(
+            symbol,
+            "min15",
+            "拉取分钟线",
+            lambda api: (
+                api.get_index_bars(1, market, code, 0, offset)
+                if is_index
+                else api.get_security_bars(1, market, code, 0, offset)
+            ),
+            penalize_none=True,
+            default_on_fail=[],
+        )
 
-    def fetch_xdxr_events(self, symbol: str) -> List[Dict]:
-        """获取除权除息及股本变动事件（带 2 次重试与断开保护）"""
+    def fetch_xdxr_events(self, symbol: str) -> Optional[List[Dict]]:
+        """获取除权除息及股本变动事件（带 2 次重试与断开保护；RPC 失败返回 None，无事件返回 []）"""
         market, code, is_idx = parse_symbol(symbol)
         if is_idx:
             return []
-        for retry in range(2):
-            curr_server = None
-            try:
-                api = self.pool.get_client()
-                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
-                t_rpc = time.perf_counter()
-                items = api.get_xdxr_info(market, code)
-                rpc_elapsed = time.perf_counter() - t_rpc
-                if rpc_elapsed > 1.8 and hasattr(self.pool, "record_server_error"):
-                    self.pool.record_server_error(curr_server, f"xdxr_slow:{rpc_elapsed:.2f}s")
-                if items is None:
-                    if hasattr(self.pool, "record_server_error"):
-                        self.pool.record_server_error(curr_server, "xdxr_none")
-                    self.pool.disconnect_thread()
-                    if retry == 0:
-                        continue
-                    return []
-                return items
-            except Exception as e:
-                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
-                if hasattr(self.pool, "record_server_error"):
-                    self.pool.record_server_error(curr_server, f"xdxr_exc:{type(e).__name__}")
-                self.pool.disconnect_thread()
-                if retry == 1:
-                    logger.warning(f"{symbol} 拉取除权除息失败: {e}")
-                    return []
-        return []
+        return self._call_with_retry(
+            symbol,
+            "xdxr",
+            "拉取除权除息",
+            lambda api: api.get_xdxr_info(market, code),
+            penalize_none=True,
+            default_on_fail=None,
+        )
 
     def fetch_finance_info(self, symbol: str) -> Optional[Dict]:
         """获取个股财务基本信息（含流通股本 liutongguben，单位：股；非个股返回 None）"""
         market, code, is_idx = parse_symbol(symbol)
         if is_idx or not is_stock_symbol(symbol):
             return None
-        for retry in range(2):
-            curr_server = None
-            try:
-                api = self.pool.get_client()
-                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
-                t_rpc = time.perf_counter()
-                info = api.get_finance_info(market, code)
-                rpc_elapsed = time.perf_counter() - t_rpc
-                is_slow = rpc_elapsed > 1.8
-                if is_slow:
-                    if hasattr(self.pool, "record_server_error"):
-                        self.pool.record_server_error(curr_server, f"finance_slow:{rpc_elapsed:.2f}s")
-                    self.pool.disconnect_thread()
-                if info is None or not isinstance(info, dict):
-                    # 单只退市或特殊股票无财务数据时不误伤健康节点；首次返回空时换连另一节点重试一次
-                    if retry == 0:
-                        if not is_slow:
-                            self.pool.disconnect_thread()
-                        continue
-                    return None
-                return info
-            except Exception as e:
-                curr_server = getattr(getattr(self.pool, "_local", None), "server", None)
-                if hasattr(self.pool, "record_server_error"):
-                    self.pool.record_server_error(curr_server, f"finance_exc:{type(e).__name__}")
-                self.pool.disconnect_thread()
-                if retry == 1:
-                    logger.warning(f"{symbol} 拉取财务信息失败: {e}")
-                    return None
-        return None
+        return self._call_with_retry(
+            symbol,
+            "finance",
+            "拉取财务信息",
+            lambda api: api.get_finance_info(market, code),
+            penalize_none=False,
+            require_dict=True,
+            default_on_fail=None,
+        )
 
 
 def extract_liutongguben(info: Optional[Dict]) -> Optional[float]:
@@ -689,6 +656,33 @@ def is_stock_symbol(symbol: str) -> bool:
     return True
 
 
+def _parse_valid_ohlc(
+    symbol: str, bar: Dict, bar_time_label: str
+) -> Optional[Tuple[float, float, float, float]]:
+    """校验并解析 OHLC 数值，过滤 NaN/None/<=0/high<low 的脏 bar"""
+    try:
+        o = float(bar.get("open"))
+        h = float(bar.get("high"))
+        l = float(bar.get("low"))
+        c = float(bar.get("close"))
+    except (TypeError, ValueError):
+        logger.warning(f"{symbol} 过滤无法解析的脏 OHLC bar ({bar_time_label}): {bar}")
+        return None
+    if (
+        not (math.isfinite(o) and math.isfinite(h) and math.isfinite(l) and math.isfinite(c))
+        or o <= 0.0
+        or h <= 0.0
+        or l <= 0.0
+        or c <= 0.0
+        or h < l
+    ):
+        logger.warning(
+            f"{symbol} 过滤非法 OHLC bar ({bar_time_label}): open={o}, high={h}, low={l}, close={c}"
+        )
+        return None
+    return o, h, l, c
+
+
 def parse_daily_bars_to_df(
     symbol: str, raw_bars: List[Dict], min_trade_date: Optional[datetime.date] = None
 ) -> pd.DataFrame:
@@ -706,15 +700,19 @@ def parse_daily_bars_to_df(
         t_date = datetime.datetime.strptime(dt_str, "%Y-%m-%d").date()
         if min_trade_date is not None and t_date <= min_trade_date:
             continue
+        ohlc = _parse_valid_ohlc(symbol, b, dt_str)
+        if ohlc is None:
+            continue
+        o, h, l, c = ohlc
         vol_val = float(b["vol"]) / vol_divider
         if 0.0 < vol_val < 1e-4:
             vol_val = 0.0
         records.append({
             "trade_date": t_date,
-            "open": float(b["open"]),
-            "high": float(b["high"]),
-            "low": float(b["low"]),
-            "close": float(b["close"]),
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
             "volume": vol_val,
             "amount": float(b["amount"]),
         })
@@ -772,6 +770,10 @@ def parse_minute_bars_to_df(
 
         bar_end_dt = datetime.datetime.strptime(f"{d_str} {t_str}", "%Y-%m-%d %H:%M:%S")
 
+        ohlc = _parse_valid_ohlc(symbol, b, dt_str)
+        if ohlc is None:
+            continue
+        o, h, l, c = ohlc
         vol_val = float(b["vol"]) / vol_divider
         if 0.0 < vol_val < 1e-4:
             vol_val = 0.0
@@ -779,10 +781,10 @@ def parse_minute_bars_to_df(
             "trading_date": t_date,
             "bar_end": bar_end_dt,
             "slot_seq": slot,
-            "open": float(b["open"]),
-            "high": float(b["high"]),
-            "low": float(b["low"]),
-            "close": float(b["close"]),
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
             "volume": vol_val,
             "amount": float(b["amount"]),
         })
